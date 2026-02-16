@@ -165,10 +165,3 @@ if __name__ == "__main__":
 
         traceback.print_exc()
         sys.exit(1)
-
-
-# Need some changes, when user click on enroll it should asks for unique id and create another command for admin to make id (XKP87) for every members, so when
-# user enter id, it should verify id and proceed accordingly.
-# Now, when user got DM the intro would be on day 1  only + content for day 1 and then next day only content for day 2, 3, 4, and so on...
-
-# Now provide complete supabase_scheme.sql as of now, check all history chats and provide one to go schema
