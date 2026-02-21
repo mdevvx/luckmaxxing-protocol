@@ -1,32 +1,133 @@
 import discord
-from discord.ext import commands
+import config
 from discord import app_commands
+from discord.ext import commands
+from typing import Optional
+
 from database import get_database
 from database.base import DatabaseBase
+from utils.bot_logger import BotLogger
 from utils.logger import logger
 
 
 class AdminCog(commands.Cog):
-    """Admin commands for bot management"""
+    """Administrative commands for managing the Luckmaxxing Protocol."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.db: DatabaseBase = get_database()
+        self.bot_log = BotLogger(bot, self.db)
 
-    async def load(self):
-        """Called when cog is loaded"""
+    async def cog_load(self):
         await self.db.initialize()
-        logger.info("✅ Admin cog loaded")
+        logger.info("Admin cog loaded")
 
-    async def unload(self):
-        """Called when cog is unloaded"""
+    async def cog_unload(self):
         await self.db.close()
         logger.info("Admin cog unloaded")
 
+    # ──────────────────────────────────────────
+    #  Guard helper
+    # ──────────────────────────────────────────
+
+    async def _check_enabled(self, interaction: discord.Interaction) -> bool:
+        """
+        Return True if the bot is enabled for this guild.
+        Sends an ephemeral error and returns False otherwise.
+
+        /toggle and /sync intentionally skip this check so admins can
+        always re-enable the bot or sync commands regardless of state.
+        /configure also skips it so admins can finish setup before enabling.
+        """
+        if not await self.db.is_bot_enabled(interaction.guild.id):
+            await interaction.response.send_message(
+                "The Luckmaxxing Protocol is currently **disabled** in this server.\n"
+                "Use `/toggle on` to re-enable it.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    # ──────────────────────────────────────────
+    #  /configure
+    # ──────────────────────────────────────────
+
     @app_commands.command(
-        name="toggle", description="Enable or disable the bot (Admin only)"
+        name="configure",
+        description="Set training category, onboarding role, and log channel (Admin only)",
     )
-    @app_commands.describe(state="Choose 'on' to enable or 'off' to disable")
+    @app_commands.describe(
+        category="Category where private training channels will be created",
+        role="Role assigned to users when they enroll (e.g. Baby Gamblor)",
+        log_channel="Channel where the bot posts activity logs",
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def configure(
+        self,
+        interaction: discord.Interaction,
+        category: Optional[discord.CategoryChannel] = None,
+        role: Optional[discord.Role] = None,
+        log_channel: Optional[discord.TextChannel] = None,
+    ):
+        """Persist category, role, and/or log channel for this guild."""
+        # /configure is allowed even when disabled so admins can finish setup first
+        if category is None and role is None and log_channel is None:
+            await interaction.response.send_message(
+                "Provide at least one option: `category`, `role`, or `log_channel`.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        success = await self.db.set_guild_config(
+            interaction.guild.id,
+            category_id=category.id if category else None,
+            role_id=role.id if role else None,
+            log_channel_id=log_channel.id if log_channel else None,
+        )
+
+        if not success:
+            await interaction.followup.send(
+                "Failed to save settings. Please try again.", ephemeral=True
+            )
+            return
+
+        lines = []
+        if category:
+            lines.append(f"**Training category:** {category.name}")
+        if role:
+            lines.append(f"**Onboarding role:** {role.mention}")
+        if log_channel:
+            lines.append(f"**Log channel:** {log_channel.mention}")
+
+        embed = discord.Embed(
+            title="Configuration Updated",
+            description="\n".join(lines),
+            color=config.EMBED_COLOR,
+        )
+        embed.add_field(
+            name="Next step",
+            value="Run `/setup` to post the enrollment message if you haven't already.",
+            inline=False,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        logger.info(
+            f"Guild {interaction.guild.id} configured — "
+            f"category={category.id if category else None}, "
+            f"role={role.id if role else None}, "
+            f"log_channel={log_channel.id if log_channel else None}"
+        )
+
+    # ──────────────────────────────────────────
+    #  /toggle
+    # ──────────────────────────────────────────
+
+    @app_commands.command(
+        name="toggle",
+        description="Enable or disable the bot for this server (Admin only)",
+    )
+    @app_commands.describe(state="on to enable, off to disable")
     @app_commands.choices(
         state=[
             app_commands.Choice(name="on", value="on"),
@@ -35,244 +136,245 @@ class AdminCog(commands.Cog):
     )
     @app_commands.default_permissions(administrator=True)
     async def toggle_bot(self, interaction: discord.Interaction, state: str):
-        """Toggle bot on/off for the server"""
-
         enabled = state == "on"
-
         await interaction.response.defer()
-
         await self.db.toggle_bot(interaction.guild.id, enabled)
 
-        status = "enabled✅" if enabled else "disabled ❌"
+        label = "enabled" if enabled else "disabled"
         embed = discord.Embed(
             title="Bot Status Updated",
-            description=f"The Luckmaxxing Protocol bot is now **{status}** for this server.",
-            color=discord.Color.green() if enabled else discord.Color.red(),
+            description=f"The Luckmaxxing Protocol is now **{label}** in this server.",
+            color=config.EMBED_COLOR if enabled else config.EMBED_COLOR,
         )
-
-        if not enabled:
-            embed.add_field(
-                name="Note",
-                value="Users can still view their progress, but new enrollments and daily messages are disabled.",
-                inline=False,
-            )
-
         await interaction.followup.send(embed=embed)
-        logger.info(
-            f"Bot {'enabled' if enabled else 'disabled'} for guild {interaction.guild.id}"
-        )
+        await self.bot_log.bot_toggled(interaction.guild, interaction.user, enabled)
+        logger.info(f"Bot {label} for guild {interaction.guild.id}")
 
-    @app_commands.command(
-        name="sync", description="Sync slash commands (Bot Owner only)"
-    )
-    async def sync_commands(self, interaction: discord.Interaction):
-        """Sync slash commands globally or for current guild"""
-        # Check if user is bot owner
-        app_info = await self.bot.application_info()
-
-        await interaction.response.defer()
-
-        if interaction.user.id != app_info.owner.id:
-            await interaction.followup.send(
-                "❌ Only the bot owner can use this command."
-            )
-            return
-
-        try:
-            # Sync globally
-            synced = await self.bot.tree.sync()
-
-            # Also sync to current guild for faster updates
-            synced_guild = await self.bot.tree.sync(guild=interaction.guild)
-
-            embed = discord.Embed(
-                title="✅ Commands Synced", color=discord.Color.green()
-            )
-            embed.add_field(name="Global", value=f"{len(synced)} commands", inline=True)
-            embed.add_field(
-                name="This Server", value=f"{len(synced_guild)} commands", inline=True
-            )
-
-            await interaction.followup.send(embed=embed)
-            logger.info(
-                f"Commands synced: {len(synced)} global, {len(synced_guild)} guild"
-            )
-
-        except Exception as e:
-            logger.error(f"Error syncing commands: {e}")
-            await interaction.followup.send(f"❌ Error syncing commands: {str(e)}")
-
-    @app_commands.command(
-        name="unenroll", description="Remove a user from the protocol (Admin only)"
-    )
-    @app_commands.describe(user="The user to unenroll")
-    @app_commands.default_permissions(administrator=True)
-    async def unenroll_user(self, interaction: discord.Interaction, user: discord.User):
-        """Unenroll a user from the protocol"""
-
-        await interaction.response.defer()
-
-        success = await self.db.unenroll_user(user.id, interaction.guild.id)
-
-        if success:
-            await interaction.followup.send(
-                f"✅ {user.mention} has been unenrolled from the Luckmaxxing Protocol."
-            )
-            logger.info(
-                f"Admin unenrolled user {user.id} from guild {interaction.guild.id}"
-            )
-        else:
-            await interaction.followup.send(
-                f"❌ {user.mention} is not enrolled in the protocol."
-            )
-
-    @app_commands.command(
-        name="globalstats", description="View global bot statistics (Admin only)"
-    )
-    @app_commands.default_permissions(administrator=True)
-    async def global_stats(self, interaction: discord.Interaction):
-        """View global statistics across all servers"""
-
-        await interaction.response.defer()
-
-        stats = await self.db.get_stats()  # No guild_id for global stats
-
-        embed = discord.Embed(
-            title="🌍 Global Luckmaxxing Protocol Statistics",
-            description="Statistics across all servers",
-            color=discord.Color.blue(),
-        )
-
-        embed.add_field(
-            name="Total Enrolled", value=stats["total_enrolled"], inline=True
-        )
-        embed.add_field(name="In Progress", value=stats["in_progress"], inline=True)
-        embed.add_field(name="Completed", value=stats["completed"], inline=True)
-
-        completion_rate = (
-            (stats["completed"] / stats["total_enrolled"] * 100)
-            if stats["total_enrolled"] > 0
-            else 0
-        )
-        embed.add_field(
-            name="Completion Rate", value=f"{completion_rate:.1f}%", inline=False
-        )
-
-        embed.add_field(name="Total Servers", value=len(self.bot.guilds), inline=True)
-
-        await interaction.followup.send(embed=embed)
-
-    @app_commands.command(
-        name="status", description="Check bot status and configuration"
-    )
-    async def status(self, interaction: discord.Interaction):
-        """Check bot status"""
-
-        await interaction.response.defer()
-
-        settings = await self.db.get_guild_settings(interaction.guild.id)
-
-        embed = discord.Embed(title="🤖 Bot Status", color=discord.Color.blue())
-
-        status = "Enabled ✅" if settings.get("bot_enabled", True) else "Disabled ❌"
-        embed.add_field(name="Status", value=status, inline=True)
-
-        embed.add_field(name="Servers", value=len(self.bot.guilds), inline=True)
-        embed.add_field(
-            name="Latency", value=f"{round(self.bot.latency * 1000)}ms", inline=True
-        )
-
-        embed.set_footer(text=f"Bot ID: {self.bot.user.id}")
-
-        await interaction.followup.send(embed=embed)
+    # ──────────────────────────────────────────
+    #  /generateid
+    # ──────────────────────────────────────────
 
     @app_commands.command(
         name="generateid",
-        description="Generate enrollment IDs for members (Admin only)",
+        description="Generate enrollment codes for members (Admin only)",
     )
-    @app_commands.describe(count="Number of IDs to generate (default: 1, max: 50)")
+    @app_commands.describe(count="How many codes to generate (1–50, default 1)")
     @app_commands.default_permissions(administrator=True)
     async def generate_id(self, interaction: discord.Interaction, count: int = 1):
-        """Generate unique enrollment IDs"""
-
-        # Validate first, but don't respond yet
-        if count < 1 or count > 50:
+        if not await self._check_enabled(interaction):
+            return
+        if not 1 <= count <= 50:
             await interaction.response.send_message(
-                "❌ Count must be between 1 and 50.", ephemeral=True
+                "Count must be between 1 and 50.", ephemeral=True
             )
             return
 
-        # Defer the response since database operations might take time
         await interaction.response.defer(ephemeral=True)
-
-        # Generate IDs
         ids = await self.db.generate_enrollment_ids(interaction.guild.id, count)
 
         if not ids:
             await interaction.followup.send(
-                "❌ Failed to generate IDs. Please try again.", ephemeral=True
+                "Failed to generate codes. Please try again.", ephemeral=True
             )
             return
 
-        # Create embed with IDs
+        id_list = "\n".join(f"`{c}`" for c in ids)
         embed = discord.Embed(
-            title="🎯 Generated Enrollment IDs",
-            description=f"Generated {len(ids)} new enrollment ID(s) for this server.",
-            color=discord.Color.green(),
+            title=f"Generated {len(ids)} Enrollment Code(s)",
+            color=config.EMBED_COLOR,
         )
-
-        # Format IDs in a nice list
-        id_list = "\n".join([f"`{id_code}`" for id_code in ids])
-        embed.add_field(name="Enrollment IDs", value=id_list, inline=False)
-
+        embed.add_field(name="Codes", value=id_list, inline=False)
         embed.add_field(
-            name="📝 Instructions",
-            value=(
-                "Share these IDs with members who should be able to enroll.\n"
-                "Each ID can only be used once and is specific to this server."
-            ),
+            name="Instructions",
+            value="Share each code with one member. Codes are single-use.",
             inline=False,
         )
-
-        embed.set_footer(text=f"Guild ID: {interaction.guild.id}")
-
+        embed.set_footer(text=f"Guild: {interaction.guild.id}")
         await interaction.followup.send(embed=embed, ephemeral=True)
+        await self.bot_log.ids_generated(interaction.guild, interaction.user, len(ids))
+        logger.info(f"Generated {len(ids)} codes for guild {interaction.guild.id}")
 
-        logger.info(
-            f"Generated {len(ids)} enrollment IDs for guild {interaction.guild.id}"
-        )
+    # ──────────────────────────────────────────
+    #  /listids
+    # ──────────────────────────────────────────
 
     @app_commands.command(
-        name="listids", description="View unused enrollment IDs (Admin only)"
+        name="listids",
+        description="View all unused enrollment codes for this server (Admin only)",
     )
     @app_commands.default_permissions(administrator=True)
     async def list_ids(self, interaction: discord.Interaction):
-        """List all unused enrollment IDs for this server"""
-
+        if not await self._check_enabled(interaction):
+            return
         await interaction.response.defer()
+        unused = await self.db.get_unused_enrollment_ids(interaction.guild.id)
 
-        unused_ids = await self.db.get_unused_enrollment_ids(interaction.guild.id)
-
-        embed = discord.Embed(
-            title="📋 Unused Enrollment IDs",
-            color=discord.Color.blue(),
-        )
-
-        if not unused_ids:
-            embed.description = "No unused enrollment IDs available.\n\nUse `/generateid` to create new IDs."
+        embed = discord.Embed(title="Unused Enrollment Codes", color=config.EMBED_COLOR)
+        if unused:
+            embed.description = "\n".join(f"`{c}`" for c in unused)
+            embed.set_footer(text=f"{len(unused)} unused code(s)")
         else:
-            id_list = "\n".join([f"`{id_code}`" for id_code in unused_ids])
-            embed.description = f"**{len(unused_ids)} unused ID(s):**\n\n{id_list}"
-
-            embed.add_field(
-                name="💡 Tip",
-                value="Share these IDs with members to allow them to enroll.",
-                inline=False,
-            )
+            embed.description = "No unused codes. Use `/generateid` to create some."
 
         await interaction.followup.send(embed=embed)
 
+    # ──────────────────────────────────────────
+    #  /unenroll
+    # ──────────────────────────────────────────
+
+    @app_commands.command(
+        name="unenroll",
+        description="Remove a user from the protocol (Admin only)",
+    )
+    @app_commands.describe(user="The user to unenroll")
+    @app_commands.default_permissions(administrator=True)
+    async def unenroll_user(self, interaction: discord.Interaction, user: discord.User):
+        if not await self._check_enabled(interaction):
+            return
+        await interaction.response.defer()
+
+        # Grab channel_id before deleting the row
+        progress = await self.db.get_user_progress(user.id, interaction.guild.id)
+        channel_id = progress.get("channel_id") if progress else None
+
+        success = await self.db.unenroll_user(user.id, interaction.guild.id)
+        if not success:
+            await interaction.followup.send(
+                f"{user.mention} is not enrolled.", ephemeral=True
+            )
+            return
+
+        # Optionally delete the training channel
+        if channel_id:
+            channel = interaction.guild.get_channel(channel_id)
+            if channel:
+                try:
+                    await channel.delete(
+                        reason=f"Unenrolled by admin {interaction.user}"
+                    )
+                except discord.Forbidden:
+                    logger.warning(f"Could not delete channel {channel_id}")
+
+        await interaction.followup.send(
+            f"{user.mention} has been unenrolled and their training channel removed."
+        )
+        await self.bot_log.unenrolled(interaction.guild, user, interaction.user)
+        logger.info(
+            f"Admin unenrolled user {user.id} from guild {interaction.guild.id}"
+        )
+
+    # ──────────────────────────────────────────
+    #  /globalstats
+    # ──────────────────────────────────────────
+
+    @app_commands.command(
+        name="globalstats",
+        description="View statistics across all servers (Admin only)",
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def global_stats(self, interaction: discord.Interaction):
+        if not await self._check_enabled(interaction):
+            return
+        await interaction.response.defer()
+        stats = await self.db.get_stats()  # No guild_id = global
+        total = stats["total_enrolled"]
+        rate = f"{stats['completed'] / total * 100:.1f}%" if total else "N/A"
+
+        embed = discord.Embed(
+            title="Global Luckmaxxing Protocol Statistics",
+            color=config.EMBED_COLOR,
+        )
+        embed.add_field(name="Total Enrolled", value=total, inline=True)
+        embed.add_field(name="In Progress", value=stats["in_progress"], inline=True)
+        embed.add_field(name="Completed", value=stats["completed"], inline=True)
+        embed.add_field(name="Completion Rate", value=rate, inline=False)
+        embed.add_field(name="Servers", value=len(self.bot.guilds), inline=True)
+        await interaction.followup.send(embed=embed)
+
+    # ──────────────────────────────────────────
+    #  /status
+    # ──────────────────────────────────────────
+
+    @app_commands.command(
+        name="status", description="Check bot status and configuration (Admin only)"
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def status(self, interaction: discord.Interaction):
+        if not await self._check_enabled(interaction):
+            return
+        await interaction.response.defer()
+        settings = await self.db.get_guild_settings(interaction.guild.id)
+
+        bot_status = "Enabled" if settings.get("bot_enabled", True) else "Disabled"
+        category_id = settings.get("category_id")
+        role_id = settings.get("role_id")
+        log_channel_id = settings.get("log_channel_id")
+
+        category_label = (
+            interaction.guild.get_channel(category_id).name
+            if category_id and interaction.guild.get_channel(category_id)
+            else "Not set"
+        )
+        role_label = (
+            interaction.guild.get_role(role_id).name
+            if role_id and interaction.guild.get_role(role_id)
+            else "Not set"
+        )
+        log_label = (
+            interaction.guild.get_channel(log_channel_id).mention
+            if log_channel_id and interaction.guild.get_channel(log_channel_id)
+            else "Not set"
+        )
+
+        embed = discord.Embed(title="Bot Status", color=config.EMBED_COLOR)
+        embed.add_field(name="Status", value=bot_status, inline=True)
+        embed.add_field(
+            name="Latency", value=f"{round(self.bot.latency * 1000)}ms", inline=True
+        )
+        embed.add_field(name="Servers", value=len(self.bot.guilds), inline=True)
+        embed.add_field(name="Training Category", value=category_label, inline=True)
+        embed.add_field(name="Onboarding Role", value=role_label, inline=True)
+        embed.add_field(name="Log Channel", value=log_label, inline=True)
+        embed.set_footer(text=f"Bot ID: {self.bot.user.id}")
+        await interaction.followup.send(embed=embed)
+
+    # ──────────────────────────────────────────
+    #  /sync  (owner only)
+    # ──────────────────────────────────────────
+
+    @app_commands.command(
+        name="sync",
+        description="Sync slash commands globally (Bot Owner only)",
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def sync_commands(self, interaction: discord.Interaction):
+        app_info = await self.bot.application_info()
+        if interaction.user.id != app_info.owner.id:
+            await interaction.response.send_message(
+                "Only the bot owner can use this command.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
+        try:
+            global_cmds = await self.bot.tree.sync()
+            guild_cmds = await self.bot.tree.sync(guild=interaction.guild)
+
+            embed = discord.Embed(title="Commands Synced", color=config.EMBED_COLOR)
+            embed.add_field(
+                name="Global", value=f"{len(global_cmds)} commands", inline=True
+            )
+            embed.add_field(
+                name="This Server", value=f"{len(guild_cmds)} commands", inline=True
+            )
+            await interaction.followup.send(embed=embed)
+            logger.info(
+                f"Commands synced: {len(global_cmds)} global, {len(guild_cmds)} guild"
+            )
+        except Exception as exc:
+            logger.error(f"sync_commands: {exc}")
+            await interaction.followup.send(f"Sync failed: {exc}")
+
 
 async def setup(bot: commands.Bot):
-    """Setup function for cog"""
     await bot.add_cog(AdminCog(bot))

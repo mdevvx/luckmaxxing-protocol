@@ -1,94 +1,90 @@
 import discord
+import config
 from typing import Callable
+
 from utils.logger import logger
 
 
-class EnrollmentIDModal(discord.ui.Modal, title="Enter Enrollment ID"):
-    """Modal for entering enrollment ID"""
+class EnrollmentModal(discord.ui.Modal, title="Enter Enrollment ID"):
+    """
+    Modal that pops up when a user clicks the Enroll button.
+    Accepts a 5-character enrollment code and passes it to the provided callback.
+    """
 
     enrollment_id = discord.ui.TextInput(
         label="Enrollment ID",
-        placeholder="Enter your 5-character enrollment ID (e.g., XKP87)",
+        placeholder="Enter your 5-character code (e.g. XKP87)",
         min_length=5,
         max_length=5,
         required=True,
     )
 
-    def __init__(self, on_submit_callback: Callable):
+    def __init__(self, on_submit: Callable):
         super().__init__()
-        self.on_submit_callback = on_submit_callback
+        self._on_submit = on_submit
 
     async def on_submit(self, interaction: discord.Interaction):
-        """Handle modal submission"""
         try:
-            # Pass the enrollment ID to the callback
-            await self.on_submit_callback(interaction, self.enrollment_id.value)
-        except Exception as e:
-            logger.error(f"Error in enrollment ID modal callback: {e}")
-            await interaction.response.send_message(
-                "❌ An error occurred. Please try again later.",
-                ephemeral=True,
-            )
+            await self._on_submit(interaction, self.enrollment_id.value.upper())
+        except Exception as exc:
+            logger.error(f"EnrollmentModal.on_submit: {exc}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "An error occurred. Please try again.", ephemeral=True
+                )
 
 
 class EnrollmentView(discord.ui.View):
-    """Persistent view for enrollment button"""
+    """
+    Persistent view (survives bot restarts) that shows the Enroll button
+    in the #luckmaxxing-protocol channel.
+    """
 
     def __init__(self, on_enroll: Callable):
         """
-        Initialize enrollment view
-
         Args:
-            on_enroll: Async callback function when user submits enrollment ID
-                       Signature: async def callback(interaction, enrollment_id)
+            on_enroll: async callback(interaction, enrollment_id_str)
         """
-        super().__init__(timeout=None)  # Persistent view (no timeout)
-        self.on_enroll_callback = on_enroll
+        super().__init__(timeout=None)  # Persistent – no expiry
+        self._on_enroll = on_enroll
 
     @discord.ui.button(
-        label="🎯 Enroll in Luckmaxxing Protocol",
+        label="Enroll in Luckmaxxing Protocol",
         style=discord.ButtonStyle.success,
-        custom_id="enroll_button",  # Persistent ID
+        custom_id="luckmaxx_enroll",  # Stable ID required for persistence
     )
     async def enroll_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        """Handle enrollment button click - show ID input modal"""
         try:
-            # Show the ID input modal
-            modal = EnrollmentIDModal(on_submit_callback=self.on_enroll_callback)
+            modal = EnrollmentModal(on_submit=self._on_enroll)
             await interaction.response.send_modal(modal)
-        except Exception as e:
-            logger.error(f"Error showing enrollment modal: {e}")
+        except Exception as exc:
+            logger.error(f"EnrollmentView.enroll_button: {exc}")
             await interaction.response.send_message(
-                "❌ An error occurred. Please try again later.",
-                ephemeral=True,
+                "An error occurred. Please try again.", ephemeral=True
             )
 
 
 def create_enrollment_embed() -> discord.Embed:
-    """Create the enrollment embed for the protocol channel"""
+    """Return the embed posted in the #luckmaxxing-protocol channel."""
     embed = discord.Embed(
-        title="🎯 Luckmaxxing Protocol",
+        title="Luckmaxxing Protocol",
         description=(
-            "Welcome to the **8-Day Luckmaxxing Training Program**!\n\n"
+            "Welcome to the **8-Day Luckmaxxing Training Program**.\n\n"
             "Transform from an average gamblor into a statistical anomaly. "
-            "This intensive training will equip you with the tools to cultivate luck as a skill.\n\n"
-            "**What to Expect:**\n"
-            "• Daily training delivered via DM\n"
-            "• Interactive dialogue format\n"
-            "• 8 days of transformative exercises\n"
+            "Daily interactive lessons will be delivered in your own private channel.\n\n"
+            "**What to expect**\n"
+            "• Intro + Day 1 on enrollment\n"
+            "• Days 2 – 8 delivered automatically every 24 hours\n"
+            "• Click through dialogue to progress\n"
             "• Scientifically-backed luck cultivation techniques\n\n"
-            "**Requirements:**\n"
-            "✅ Valid enrollment ID (get from admins)\n"
-            "✅ Commitment to daily practice\n"
-            "✅ Open DMs to receive training\n"
-            "✅ Dedication to your transformation\n\n"
-            "Click the button below and enter your enrollment ID to begin your journey."
+            "**Requirements**\n"
+            "• A valid enrollment code from an admin\n"
+            "• Commitment to daily practice\n\n"
+            "Click **Enroll** and enter your code to begin."
         ),
-        color=discord.Color.gold(),
+        color=config.EMBED_COLOR,
     )
-
-    embed.set_footer(text="Gorillions await you. 🚀")
-
+    embed.set_footer(text="Gorillions await you.")
     return embed

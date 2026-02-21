@@ -1,138 +1,157 @@
 import discord
-from typing import List, Tuple, Optional, Callable
+import config
+from typing import Callable, List, Optional, Tuple
+
 from utils.logger import logger
 
 
 class DialogueView(discord.ui.View):
-    """Interactive view for dialogue progression"""
+    """
+    Interactive view that drives the step-by-step training dialogue.
+
+    Each "Gamblors" line becomes a clickable button (the user's response).
+    "Intern" lines are displayed in the embed automatically.
+
+    The view is posted in the user's private training channel.
+    Only the enrolled user can interact with it.
+    """
+
+    # ──────────────────────────────────────────
+    #  Construction
+    # ──────────────────────────────────────────
 
     def __init__(
         self,
         content: List[Tuple[str, str]],
         on_complete: Optional[Callable] = None,
-        timeout: float = 300,
+        user_id: Optional[int] = None,
+        timeout: float = 600,
     ):
         """
-        Initialize dialogue view
-
         Args:
-            content: List of (speaker, message) tuples
-            on_complete: Callback function when dialogue is complete
-            timeout: Timeout in seconds (default 5 minutes)
+            content:     List of (speaker, message) tuples.
+            on_complete: Async callback(user) invoked when the last button is pressed.
+            user_id:     If set, only this Discord user can interact with the view.
+            timeout:     Seconds before the view auto-disables (default 10 min).
         """
         super().__init__(timeout=timeout)
         self.content = content
-        self.current_index = 0
         self.on_complete_callback = on_complete
+        self.user_id = user_id
+        self.current_index: int = 0
         self.message: Optional[discord.Message] = None
 
-        # Update button state
-        self._update_buttons()
+        self._render_buttons()
 
-    def _update_buttons(self):
-        """Update button states based on current position"""
-        # Clear existing buttons
+    # ──────────────────────────────────────────
+    #  Interaction guard
+    # ──────────────────────────────────────────
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Reject button presses from users other than the enrolled trainee."""
+        if self.user_id and interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "This is not your training channel.", ephemeral=True
+            )
+            return False
+        return True
+
+    # ──────────────────────────────────────────
+    #  Button management
+    # ──────────────────────────────────────────
+
+    def _render_buttons(self):
+        """Rebuild the button row for the current position."""
         self.clear_items()
 
-        # Add Next button if not at the end
-        if self.current_index < len(self.content) - 1:
-            next_button = discord.ui.Button(
-                label=self._get_button_label(),
-                style=discord.ButtonStyle.primary,
-                custom_id="next",
-            )
-            next_button.callback = self._next_callback
-            self.add_item(next_button)
-        else:
-            # Add Complete button at the end
-            complete_button = discord.ui.Button(
-                label="✅ Complete",
+        at_end = self.current_index >= len(self.content) - 1
+
+        if at_end:
+            btn = discord.ui.Button(
+                label="Complete",
                 style=discord.ButtonStyle.success,
-                custom_id="complete",
+                custom_id="dialogue_complete",
             )
-            complete_button.callback = self._complete_callback
-            self.add_item(complete_button)
-
-    def _get_button_label(self) -> str:
-        """Get label for the next button based on current speaker"""
-        if self.current_index + 1 < len(self.content):
-            next_speaker, next_message = self.content[self.current_index + 1]
+            btn.callback = self._on_complete
+        else:
+            # Show the next Gamblors line as the button label so it feels like
+            # the user is *speaking* the response.
+            next_speaker, next_msg = self.content[self.current_index + 1]
             if next_speaker == "Gamblors":
-                # Show the Gamblor's response as the button text
-                # Truncate if too long (Discord button limit is 80 chars)
-                label = (
-                    next_message[:77] + "..."
-                    if len(next_message) > 80
-                    else next_message
-                )
-                return label
-        return "Next ➡️"
+                label = next_msg[:77] + "..." if len(next_msg) > 80 else next_msg
+            else:
+                label = "Next"
 
-    async def _next_callback(self, interaction: discord.Interaction):
-        """Handle next button click"""
+            btn = discord.ui.Button(
+                label=label,
+                style=discord.ButtonStyle.primary,
+                custom_id="dialogue_next",
+            )
+            btn.callback = self._on_next
+
+        self.add_item(btn)
+
+    # ──────────────────────────────────────────
+    #  Callbacks
+    # ──────────────────────────────────────────
+
+    async def _on_next(self, interaction: discord.Interaction):
         await interaction.response.defer()
-
-        # Move to next dialogue
         self.current_index += 1
-
-        # Update the message
-        embed = self._create_embed()
-        self._update_buttons()
-
+        self._render_buttons()
         try:
-            await interaction.message.edit(embed=embed, view=self)
-            logger.debug(f"Moved to dialogue index {self.current_index}")
-        except Exception as e:
-            logger.error(f"Error updating dialogue: {e}")
+            await interaction.message.edit(embed=self._build_embed(), view=self)
+        except Exception as exc:
+            logger.error(f"DialogueView._on_next edit failed: {exc}")
 
-    async def _complete_callback(self, interaction: discord.Interaction):
-        """Handle complete button click"""
+    async def _on_complete(self, interaction: discord.Interaction):
         await interaction.response.defer()
 
-        # Disable all buttons
+        # Disable all buttons to signal finality
         for item in self.children:
-            item.disabled = True
+            item.disabled = True  # type: ignore[attr-defined]
 
         try:
             await interaction.message.edit(view=self)
+        except Exception as exc:
+            logger.error(f"DialogueView._on_complete edit failed: {exc}")
 
-            # Call completion callback if provided
-            if self.on_complete_callback:
+        if self.on_complete_callback:
+            try:
                 await self.on_complete_callback(interaction.user)
+            except Exception as exc:
+                logger.error(f"on_complete_callback raised: {exc}")
 
-            logger.info(f"User {interaction.user.id} completed dialogue")
-        except Exception as e:
-            logger.error(f"Error completing dialogue: {e}")
+        logger.info(f"User {interaction.user.id} completed a dialogue")
 
-    def _create_embed(self) -> discord.Embed:
-        """Create embed for current dialogue"""
+    # ──────────────────────────────────────────
+    #  Embed builder
+    # ──────────────────────────────────────────
+
+    def _build_embed(self) -> discord.Embed:
         speaker, message = self.content[self.current_index]
-
-        # Choose color based on speaker
-        color = discord.Color.blue() if speaker == "Intern" else discord.Color.green()
-
+        color = config.EMBED_COLOR if speaker == "Intern" else config.EMBED_COLOR
         embed = discord.Embed(description=message, color=color)
-
-        # Add speaker as footer
         embed.set_footer(
-            text=f"{speaker} • {self.current_index + 1}/{len(self.content)}"
+            text=f"{speaker}  •  {self.current_index + 1}/{len(self.content)}"
         )
-
         return embed
 
     def get_initial_embed(self) -> discord.Embed:
-        """Get the initial embed to display"""
-        return self._create_embed()
+        return self._build_embed()
+
+    # ──────────────────────────────────────────
+    #  Timeout
+    # ──────────────────────────────────────────
 
     async def on_timeout(self):
-        """Handle view timeout"""
-        # Disable all buttons
         for item in self.children:
-            item.disabled = True
-
+            item.disabled = True  # type: ignore[attr-defined]
         if self.message:
             try:
-                await self.message.edit(view=self)
-                logger.debug("Dialogue view timed out")
-            except:
+                await self.message.edit(
+                    content="> Session timed out. The next day's content will arrive in 24 hours.",
+                    view=self,
+                )
+            except Exception:
                 pass

@@ -1,167 +1,115 @@
+import asyncio
+import os
+import sys
+
 import discord
 from discord.ext import commands
-import asyncio
-import sys
-import os
 
-# Import configuration
 import config
-
-# Create logs directory if it doesn't exist
-os.makedirs("logs", exist_ok=True)
+from utils.logger import logger
 
 
 class LuckmaxxingBot(commands.Bot):
-    """Main bot class for Luckmaxxing Protocol"""
+    """Main bot class."""
 
     def __init__(self):
-        # Configure Discord intents (permissions)
         intents = discord.Intents.default()
-        intents.message_content = True  # Read message content
-        intents.members = True  # Access member information
-        intents.guilds = True  # Access guild information
+        intents.message_content = True
+        intents.members = True
+        intents.guilds = True
 
-        # Initialize bot
         super().__init__(
-            command_prefix="!",  # Prefix for text commands (we use slash commands)
+            command_prefix="!",  # Only used for legacy text commands (none currently)
             intents=intents,
-            help_command=None,  # Disable default help command
+            help_command=None,
             case_insensitive=True,
         )
 
-        # List of cogs (extensions) to load
         self.initial_extensions = [
-            "cogs.protocol",  # Main training protocol
-            "cogs.admin",  # Admin commands
+            "cogs.protocol",
+            "cogs.admin",
         ]
 
     async def setup_hook(self):
-        """
-        Setup hook - called when bot is starting up
-        Loads all cogs (command modules)
-        """
-        print("🔧 Setting up bot...")
-
-        # Load all cogs
-        for extension in self.initial_extensions:
+        """Load cogs before the bot connects."""
+        for ext in self.initial_extensions:
             try:
-                await self.load_extension(extension)
-                print(f"✅ Loaded: {extension}")
-            except Exception as e:
-                print(f"❌ Failed to load {extension}: {e}")
-                import traceback
-
-                traceback.print_exc()
-
-        print("✅ Setup complete!")
+                await self.load_extension(ext)
+                logger.info(f"Loaded extension: {ext}")
+            except Exception as exc:
+                logger.error(f"Failed to load {ext}: {exc}", exc_info=True)
 
     async def on_ready(self):
-        """Called when bot successfully connects to Discord"""
-        print("\n" + "=" * 50)
-        print(f"🤖 Bot logged in as: {self.user}")
-        print(f"🆔 Bot ID: {self.user.id}")
-        print(f"🌍 Connected to {len(self.guilds)} servers")
-        print(f"📚 Discord.py version: {discord.__version__}")
-        print("=" * 50 + "\n")
+        logger.info(f"Logged in as {self.user} (ID: {self.user.id})")
+        logger.info(f"Connected to {len(self.guilds)} server(s)")
 
-        # Set bot status/activity
-        activity = discord.Activity(
-            type=discord.ActivityType.watching,
-            name="",
-        )
-        await self.change_presence(activity=activity)
-
-        print("✅ Bot is ready and online!\n")
+        # await self.change_presence(
+        #     activity=discord.Activity(
+        #         type=discord.ActivityType.watching,
+        #         name="the gamblors train",
+        #     )
+        # )
 
     async def on_guild_join(self, guild: discord.Guild):
-        """Called when bot joins a new server"""
-        print(f"📥 Joined new server: {guild.name} (ID: {guild.id})")
-        print(f"   Members: {guild.member_count}")
-
-        # Send welcome message to system channel if available
+        logger.info(
+            f"Joined guild: {guild.name} ({guild.id}), members: {guild.member_count}"
+        )
         if guild.system_channel:
             embed = discord.Embed(
-                title="🎯 Thanks for adding Luckmaxxing Protocol!",
+                title="Luckmaxxing Protocol has arrived",
                 description=(
-                    "I'm here to help transform your members into statistical anomalies.\n\n"
-                    "**Quick Start:**\n"
-                    "1. Run `/setup` to create the enrollment channel\n"
-                    "2. Members can enroll and receive daily training via DM\n\n"
-                    "**Commands:**\n"
-                    "`/setup` - Setup protocol channel\n"
-                    "`/stats` - View statistics\n"
-                    "`/toggle` - Enable/disable bot\n\n"
-                    "Gorillions await! 🚀"
+                    "Ready to transform your members into statistical anomalies.\n\n"
+                    "**Quick start**\n"
+                    "1. `/configure role:<role> category:<category>` — set the onboarding role and channel category\n"
+                    "2. `/setup` — post the enrollment message\n"
+                    "3. `/generateid count:10` — create enrollment codes for your members\n\n"
+                    "Gorillions await."
                 ),
-                color=discord.Color.gold(),
+                color=config.EMBED_COLOR,
             )
             try:
                 await guild.system_channel.send(embed=embed)
-            except:
-                pass  # If we can't send, that's okay
+            except discord.Forbidden:
+                pass
 
     async def on_guild_remove(self, guild: discord.Guild):
-        """Called when bot is removed from a server"""
-        print(f"📤 Removed from server: {guild.name} (ID: {guild.id})")
+        logger.info(f"Removed from guild: {guild.name} ({guild.id})")
 
     async def on_error(self, event: str, *args, **kwargs):
-        """Global error handler"""
-        print(f"❌ Error in {event}:")
-        import traceback
-
-        traceback.print_exc()
+        logger.error(f"Unhandled error in event '{event}'", exc_info=True)
 
 
 async def main():
-    """Main function to start the bot"""
+    os.makedirs("logs", exist_ok=True)
 
-    # Print startup banner
-    print("\n" + "=" * 50)
-    print("🎯 LUCKMAXXING PROTOCOL BOT")
-    print("=" * 50 + "\n")
+    logger.info("=" * 50)
+    logger.info("LUCKMAXXING PROTOCOL BOT — STARTING")
+    logger.info("=" * 50)
 
-    # Validate configuration
-    print("🔍 Validating configuration...")
     try:
         config.validate_config()
-        print("✅ Configuration valid!\n")
-    except ValueError as e:
-        print(str(e))
-        print("\n💡 Tip: Copy .env.example to .env and fill in your values\n")
-        return
+    except ValueError as exc:
+        logger.error(str(exc))
+        sys.exit(1)
 
-    # Create bot instance
     bot = LuckmaxxingBot()
 
-    # Start bot
     try:
-        print("🚀 Starting bot...\n")
         await bot.start(config.DISCORD_TOKEN)
     except KeyboardInterrupt:
-        print("\n⚠️  Keyboard interrupt received, shutting down...")
+        logger.info("Keyboard interrupt — shutting down")
     except discord.LoginFailure:
-        print("\n❌ Failed to login - check your DISCORD_BOT_TOKEN in .env")
-    except Exception as e:
-        print(f"\n❌ Fatal error: {e}")
-        import traceback
-
-        traceback.print_exc()
+        logger.error("Invalid DISCORD_BOT_TOKEN")
+    except Exception as exc:
+        logger.error(f"Fatal error: {exc}", exc_info=True)
     finally:
         if not bot.is_closed():
             await bot.close()
-        print("\n👋 Bot shut down successfully")
+        logger.info("Bot shut down")
 
 
 if __name__ == "__main__":
-    """Entry point when running the script"""
     try:
-        # Run the bot
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n👋 Bot stopped by user")
-    except Exception as e:
-        print(f"\n❌ Unexpected error: {e}")
-        import traceback
-
-        traceback.print_exc()
-        sys.exit(1)
+        pass

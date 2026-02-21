@@ -1,25 +1,14 @@
-"""Database package initialization"""
-
 from database.supabase_db import SupabaseDatabase
-from database.base import DatabaseBase
 
-# Singleton instance
-_database_instance = None
+_db_instance = None
 
 
-def get_database() -> DatabaseBase:
+def get_database() -> SupabaseDatabase:
     """
-    Get database instance (singleton pattern)
-
-    Returns:
-        DatabaseBase: Database implementation instance
+    Return a singleton database instance.
+    Creating one shared instance avoids duplicate connections.
     """
-    global _database_instance
-
-    if _database_instance is None:
-        _database_instance = SupabaseDatabase()
-
-    return _database_instance
-
-
-__all__ = ["get_database", "DatabaseBase", "SupabaseDatabase"]
+    global _db_instance
+    if _db_instance is None:
+        _db_instance = SupabaseDatabase()
+    return _db_instance

@@ -1,486 +1,453 @@
-from typing import Optional, List, Dict, Any
+import secrets
+import string
 from datetime import datetime
+from typing import Any, Dict, List, Optional
+
 from supabase import create_client, Client
+
+import config
 from database.base import DatabaseBase
 from utils.logger import logger
-import config
 
 
 class SupabaseDatabase(DatabaseBase):
-    """Supabase database implementation with synchronous initialization"""
+    """Concrete Supabase implementation of DatabaseBase."""
 
     def __init__(self):
-        """Initialize with immediate client creation"""
         self.client: Optional[Client] = None
         self._initialized = False
 
-        # Try to initialize immediately
+        # Attempt eager initialization so the client is ready before async startup.
         try:
             self.client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
             self._initialized = True
             logger.info("Supabase client created in __init__")
-        except Exception as e:
-            logger.error(f"Failed to create Supabase client in __init__: {e}")
-            self.client = None
-            self._initialized = False
+        except Exception as exc:
+            logger.error(f"Failed to create Supabase client in __init__: {exc}")
+
+    # ─────────────────────────────────────────────
+    #  Internal helpers
+    # ─────────────────────────────────────────────
+
+    def _get_client(self) -> Client:
+        """Return the Supabase client, re-creating it if it was lost."""
+        if self.client is None:
+            logger.warning("Supabase client is None – recreating...")
+            self.client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+        return self.client
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.utcnow().isoformat()
+
+    # ─────────────────────────────────────────────
+    #  Lifecycle
+    # ─────────────────────────────────────────────
 
     async def initialize(self) -> None:
-        """Initialize or re-initialize Supabase client"""
+        """Verify the connection by running a lightweight query."""
         try:
             if self.client is None:
                 self.client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
 
+            # Smoke-test the connection
+            self._get_client().table("enrollments").select("*").limit(1).execute()
             self._initialized = True
-            logger.info("✅ Supabase client initialized/verified")
-
-            # Test the connection immediately
-            try:
-                test_response = (
-                    self.client.table("enrollments").select("*").limit(1).execute()
-                )
-                logger.info(
-                    f"✅ Database connection verified (found {len(test_response.data) if test_response.data else 0} rows)"
-                )
-            except Exception as test_error:
-                logger.error(f"❌ Database connection test failed: {test_error}")
-                raise
-
-        except Exception as e:
-            logger.error(f"❌ Failed to initialize Supabase: {e}")
-            self.client = None
+            logger.info("Supabase connection verified")
+        except Exception as exc:
             self._initialized = False
+            self.client = None
+            logger.error(f"Supabase initialization failed: {exc}")
             raise
 
-    def _get_client(self) -> Client:
-        """Get client, creating it if necessary"""
-        if self.client is None:
-            logger.warning("Client was None, attempting to recreate...")
-            try:
-                self.client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
-                logger.info("✅ Client recreated successfully")
-            except Exception as e:
-                logger.error(f"❌ Failed to recreate client: {e}")
-                raise RuntimeError(f"Cannot connect to Supabase: {e}")
-        return self.client
-
     async def close(self) -> None:
-        """Close Supabase connection"""
         self._initialized = False
         self.client = None
         logger.info("Supabase connection closed")
 
-    async def verify_enrollment_id(self, enrollment_id: str, guild_id: int) -> bool:
-        """Verify an enrollment ID exists and is unused"""
-        try:
-            client = self._get_client()
-
-            # Check if ID exists and is unused
-            response = (
-                client.table("enrollment_ids")
-                .select("*")
-                .eq("id_code", enrollment_id)
-                .eq("guild_id", guild_id)
-                .eq("used", False)
-                .execute()
-            )
-
-            if response.data and len(response.data) > 0:
-                logger.info(
-                    f"Enrollment ID {enrollment_id} verified for guild {guild_id}"
-                )
-                return True
-            else:
-                logger.warning(
-                    f"Invalid or used enrollment ID: {enrollment_id} for guild {guild_id}"
-                )
-                return False
-
-        except Exception as e:
-            logger.error(f"Error verifying enrollment ID: {e}")
-            return False
-
-    async def enroll_user_with_id(
-        self, user_id: int, guild_id: int, enrollment_id: str
-    ) -> bool:
-        """Enroll a user in the program with a specific enrollment ID"""
-        try:
-            client = self._get_client()
-
-            # Create enrollment record
-            data = {
-                "user_id": user_id,
-                "guild_id": guild_id,
-                "enrollment_id": enrollment_id,
-                "enrollment_used": False,  # Will be set to True when they start Day 1
-                "current_day": 0,  # Start at intro
-                "enrolled_at": datetime.utcnow().isoformat(),
-            }
-
-            client.table("enrollments").insert(data).execute()
-
-            # Mark the enrollment ID as used in enrollment_ids table
-            client.table("enrollment_ids").update(
-                {
-                    "used": True,
-                    "used_by": user_id,
-                    "used_at": datetime.utcnow().isoformat(),
-                }
-            ).eq("id_code", enrollment_id).eq("guild_id", guild_id).execute()
-
-            logger.info(
-                f"✅ User {user_id} enrolled in guild {guild_id} with ID {enrollment_id}"
-            )
-            return True
-
-        except Exception as e:
-            error_msg = str(e)
-            if "duplicate" in error_msg.lower() or "unique" in error_msg.lower():
-                logger.warning(f"User {user_id} already enrolled in guild {guild_id}")
-                return False
-            logger.error(f"Error enrolling user: {e}")
-            return False
-
-    async def get_user_progress(
-        self, user_id: int, guild_id: int
-    ) -> Optional[Dict[str, Any]]:
-        """Get user's current progress"""
-        try:
-            client = self._get_client()
-            response = (
-                client.table("enrollments")
-                .select("*")
-                .eq("user_id", user_id)
-                .eq("guild_id", guild_id)
-                .execute()
-            )
-
-            if response.data and len(response.data) > 0:
-                return response.data[0]
-            return None
-        except Exception as e:
-            logger.error(f"Error getting user progress: {e}")
-            return None
-
-    async def update_user_day(
-        self, user_id: int, guild_id: int, current_day: int
-    ) -> bool:
-        """Update user's current day"""
-        try:
-            client = self._get_client()
-
-            # Update enrollment
-            client.table("enrollments").update(
-                {
-                    "current_day": current_day,
-                    "last_message_sent": datetime.utcnow().isoformat(),
-                    "completed": current_day > config.TOTAL_DAYS,
-                }
-            ).eq("user_id", user_id).eq("guild_id", guild_id).execute()
-
-            # Log progress
-            try:
-                client.table("daily_progress").insert(
-                    {
-                        "user_id": user_id,
-                        "guild_id": guild_id,
-                        "day_number": current_day,
-                        "completed_at": datetime.utcnow().isoformat(),
-                    }
-                ).execute()
-            except Exception as progress_error:
-                logger.warning(f"Failed to log daily progress: {progress_error}")
-                # Don't fail the whole operation if progress logging fails
-
-            logger.info(
-                f"✅ Updated user {user_id} to day {current_day} in guild {guild_id}"
-            )
-            return True
-        except Exception as e:
-            logger.error(f"Error updating user day: {e}")
-            return False
-
-    async def mark_enrollment_used(self, user_id: int, guild_id: int) -> bool:
-        """Mark enrollment as used when user starts Day 1"""
-        try:
-            client = self._get_client()
-            client.table("enrollments").update(
-                {
-                    "enrollment_used": True,
-                }
-            ).eq(
-                "user_id", user_id
-            ).eq("guild_id", guild_id).execute()
-
-            logger.info(
-                f"✅ Marked enrollment as used for user {user_id} in guild {guild_id}"
-            )
-            return True
-        except Exception as e:
-            logger.error(f"Error marking enrollment as used: {e}")
-            return False
-
-    async def get_guild_settings(self, guild_id: int) -> Dict[str, Any]:
-        """Get guild settings"""
-        try:
-            client = self._get_client()
-            response = (
-                client.table("guild_settings")
-                .select("*")
-                .eq("guild_id", guild_id)
-                .execute()
-            )
-
-            if response.data and len(response.data) > 0:
-                return response.data[0]
-
-            # Create default settings if not exists
-            try:
-                data = {
-                    "guild_id": guild_id,
-                    "bot_enabled": True,
-                    "created_at": datetime.utcnow().isoformat(),
-                }
-                client.table("guild_settings").insert(data).execute()
-                logger.info(f"Created default settings for guild {guild_id}")
-                return data
-            except Exception as insert_error:
-                logger.warning(f"Failed to create default settings: {insert_error}")
-                # Return default even if insert fails
-                return {"guild_id": guild_id, "bot_enabled": True}
-
-        except Exception as e:
-            logger.error(f"Error getting guild settings: {e}")
-            return {"guild_id": guild_id, "bot_enabled": True}
-
-    async def toggle_bot(self, guild_id: int, enabled: bool) -> None:
-        """Enable or disable bot for a guild"""
-        try:
-            client = self._get_client()
-            client.table("guild_settings").upsert(
-                {
-                    "guild_id": guild_id,
-                    "bot_enabled": enabled,
-                    "updated_at": datetime.utcnow().isoformat(),
-                }
-            ).execute()
-            logger.info(
-                f"Bot {'enabled' if enabled else 'disabled'} for guild {guild_id}"
-            )
-        except Exception as e:
-            logger.error(f"Error toggling bot: {e}")
-
-    async def is_bot_enabled(self, guild_id: int) -> bool:
-        """Check if bot is enabled for a guild"""
-        settings = await self.get_guild_settings(guild_id)
-        return settings.get("bot_enabled", True)
-
-    async def get_all_enrolled_users(self) -> List[Dict[str, Any]]:
-        """Get all enrolled users who are ready for their next message (24hr+ since last message)"""
-        try:
-            client = self._get_client()
-
-            # Get users who:
-            # 1. Haven't completed (completed = false)
-            # 2. Are on Day 1-8 (not intro, current_day > 0)
-            response = (
-                client.table("enrollments")
-                .select("*")
-                .eq("completed", False)
-                .gt("current_day", 0)  # Only users past intro
-                .execute()
-            )
-
-            # Filter for users who haven't received a message in 24+ hours
-            if response.data:
-                result = []
-                for enrollment in response.data:
-                    last_sent = enrollment.get("last_message_sent")
-
-                    # If never sent a message, or sent 24+ hours ago
-                    if not last_sent:
-                        result.append(enrollment)
-                    else:
-                        try:
-                            last_sent_dt = datetime.fromisoformat(
-                                last_sent.replace("Z", "+00:00")
-                            )
-                            hours_since = (
-                                datetime.utcnow() - last_sent_dt.replace(tzinfo=None)
-                            ).total_seconds() / 3600
-
-                            if hours_since >= 24:
-                                result.append(enrollment)
-                        except Exception as e:
-                            logger.warning(
-                                f"Error parsing date for user {enrollment.get('user_id')}: {e}"
-                            )
-                            # Include user if we can't parse the date (safer)
-                            result.append(enrollment)
-
-                return result
-
-            return []
-        except Exception as e:
-            logger.error(f"Error getting enrolled users: {e}")
-            return []
-
-    async def unenroll_user(self, user_id: int, guild_id: int) -> bool:
-        """Unenroll a user from the program and remove all related data"""
-        try:
-            client = self._get_client()
-
-            # Get the enrollment ID first so we can free it up
-            enrollment = await self.get_user_progress(user_id, guild_id)
-            enrollment_id = enrollment.get("enrollment_id") if enrollment else None
-
-            # Delete from daily_progress first (foreign key consideration)
-            try:
-                client.table("daily_progress").delete().eq("user_id", user_id).eq(
-                    "guild_id", guild_id
-                ).execute()
-                logger.info(
-                    f"Deleted daily progress for user {user_id} in guild {guild_id}"
-                )
-            except Exception as e:
-                logger.warning(f"Error deleting daily progress: {e}")
-
-            # Delete from enrollments
-            client.table("enrollments").delete().eq("user_id", user_id).eq(
-                "guild_id", guild_id
-            ).execute()
-
-            # Free up the enrollment ID if it exists
-            if enrollment_id:
-                try:
-                    client.table("enrollment_ids").update(
-                        {
-                            "used": False,
-                            "used_by": None,
-                            "used_at": None,
-                        }
-                    ).eq("id_code", enrollment_id).eq("guild_id", guild_id).execute()
-                    logger.info(f"Freed enrollment ID {enrollment_id}")
-                except Exception as e:
-                    logger.warning(f"Error freeing enrollment ID: {e}")
-
-            logger.info(f"✅ User {user_id} fully unenrolled from guild {guild_id}")
-            return True
-        except Exception as e:
-            logger.error(f"Error unenrolling user: {e}")
-            return False
-
-    async def get_stats(self, guild_id: Optional[int] = None) -> Dict[str, Any]:
-        """Get statistics about enrollments"""
-        try:
-            client = self._get_client()
-
-            # Build base query
-            query = client.table("enrollments").select("*", count="exact")
-            if guild_id:
-                query = query.eq("guild_id", guild_id)
-
-            total_response = query.execute()
-            total = (
-                total_response.count
-                if hasattr(total_response, "count")
-                else len(total_response.data) if total_response.data else 0
-            )
-
-            # Get completed count
-            completed_query = (
-                client.table("enrollments")
-                .select("*", count="exact")
-                .eq("completed", True)
-            )
-            if guild_id:
-                completed_query = completed_query.eq("guild_id", guild_id)
-
-            completed_response = completed_query.execute()
-            completed = (
-                completed_response.count
-                if hasattr(completed_response, "count")
-                else len(completed_response.data) if completed_response.data else 0
-            )
-
-            return {
-                "total_enrolled": total,
-                "completed": completed,
-                "in_progress": total - completed,
-            }
-        except Exception as e:
-            logger.error(f"Error getting stats: {e}")
-            return {"total_enrolled": 0, "completed": 0, "in_progress": 0}
+    # ─────────────────────────────────────────────
+    #  Enrollment IDs
+    # ─────────────────────────────────────────────
 
     async def generate_enrollment_ids(self, guild_id: int, count: int) -> List[str]:
-        """Generate unique enrollment IDs for a guild"""
-        try:
-            client = self._get_client()
-            generated_ids = []
+        client = self._get_client()
+        generated: List[str] = []
+        attempts = 0
 
-            import secrets
-            import string
+        while len(generated) < count and attempts < count * 3:
+            attempts += 1
+            code = "".join(
+                secrets.choice(string.ascii_uppercase + string.digits) for _ in range(5)
+            )
+            try:
+                client.table("enrollment_ids").insert(
+                    {
+                        "id_code": code,
+                        "guild_id": guild_id,
+                        "used": False,
+                        "created_at": self._now(),
+                    }
+                ).execute()
+                generated.append(code)
+                logger.info(f"Generated enrollment ID {code} for guild {guild_id}")
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "duplicate" in msg or "unique" in msg:
+                    # Collision – try again
+                    continue
+                logger.error(f"Error inserting enrollment ID {code}: {exc}")
 
-            for _ in range(count):
-                # Generate a random 5-character ID
-                id_code = "".join(
-                    secrets.choice(string.ascii_uppercase + string.digits)
-                    for _ in range(5)
-                )
-
-                try:
-                    # Insert into enrollment_ids table
-                    client.table("enrollment_ids").insert(
-                        {
-                            "id_code": id_code,
-                            "guild_id": guild_id,
-                            "created_at": datetime.utcnow().isoformat(),
-                            "used": False,
-                        }
-                    ).execute()
-
-                    generated_ids.append(id_code)
-                    logger.info(
-                        f"Generated enrollment ID: {id_code} for guild {guild_id}"
-                    )
-
-                except Exception as e:
-                    error_msg = str(e)
-                    if (
-                        "duplicate" in error_msg.lower()
-                        or "unique" in error_msg.lower()
-                    ):
-                        # If duplicate, try again with a new ID
-                        logger.warning(f"Duplicate ID {id_code}, regenerating...")
-                        continue
-                    else:
-                        logger.error(f"Error generating ID {id_code}: {e}")
-                        continue
-
-            return generated_ids
-
-        except Exception as e:
-            logger.error(f"Error in generate_enrollment_ids: {e}")
-            return []
+        return generated
 
     async def get_unused_enrollment_ids(self, guild_id: int) -> List[str]:
-        """Get all unused enrollment IDs for a guild"""
         try:
-            client = self._get_client()
-
-            response = (
-                client.table("enrollment_ids")
+            resp = (
+                self._get_client()
+                .table("enrollment_ids")
                 .select("id_code")
                 .eq("guild_id", guild_id)
                 .eq("used", False)
                 .order("created_at", desc=True)
                 .execute()
             )
-
-            if response.data:
-                return [row["id_code"] for row in response.data]
-
+            return [row["id_code"] for row in (resp.data or [])]
+        except Exception as exc:
+            logger.error(f"get_unused_enrollment_ids: {exc}")
             return []
 
-        except Exception as e:
-            logger.error(f"Error getting unused enrollment IDs: {e}")
+    async def verify_enrollment_id(self, enrollment_id: str, guild_id: int) -> bool:
+        try:
+            resp = (
+                self._get_client()
+                .table("enrollment_ids")
+                .select("id")
+                .eq("id_code", enrollment_id)
+                .eq("guild_id", guild_id)
+                .eq("used", False)
+                .execute()
+            )
+            valid = bool(resp.data)
+            if not valid:
+                logger.warning(
+                    f"Invalid/used enrollment ID {enrollment_id} for guild {guild_id}"
+                )
+            return valid
+        except Exception as exc:
+            logger.error(f"verify_enrollment_id: {exc}")
+            return False
+
+    # ─────────────────────────────────────────────
+    #  User Enrollment
+    # ─────────────────────────────────────────────
+
+    async def enroll_user_with_id(
+        self, user_id: int, guild_id: int, enrollment_id: str
+    ) -> bool:
+        client = self._get_client()
+        try:
+            # Create enrollment row (channel_id filled in later via save_channel_id)
+            client.table("enrollments").insert(
+                {
+                    "user_id": user_id,
+                    "guild_id": guild_id,
+                    "enrollment_id": enrollment_id,
+                    "enrollment_used": False,
+                    "current_day": 0,
+                    "channel_id": None,
+                    "enrolled_at": self._now(),
+                }
+            ).execute()
+
+            # Mark the code as taken immediately
+            client.table("enrollment_ids").update(
+                {
+                    "used": True,
+                    "used_by": user_id,
+                    "used_at": self._now(),
+                }
+            ).eq("id_code", enrollment_id).eq("guild_id", guild_id).execute()
+
+            logger.info(f"User {user_id} enrolled in guild {guild_id}")
+            return True
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "duplicate" in msg or "unique" in msg:
+                logger.warning(f"User {user_id} already enrolled in guild {guild_id}")
+            else:
+                logger.error(f"enroll_user_with_id: {exc}")
+            return False
+
+    async def unenroll_user(self, user_id: int, guild_id: int) -> bool:
+        client = self._get_client()
+        try:
+            # Grab the enrollment to find the code to free
+            row = await self.get_user_progress(user_id, guild_id)
+            enrollment_id = row.get("enrollment_id") if row else None
+
+            # Remove analytics rows first to avoid FK issues
+            try:
+                client.table("daily_progress").delete().eq("user_id", user_id).eq(
+                    "guild_id", guild_id
+                ).execute()
+            except Exception as exc:
+                logger.warning(f"Could not delete daily_progress: {exc}")
+
+            # Remove the enrollment itself
+            client.table("enrollments").delete().eq("user_id", user_id).eq(
+                "guild_id", guild_id
+            ).execute()
+
+            # Free the enrollment code
+            if enrollment_id:
+                try:
+                    client.table("enrollment_ids").update(
+                        {"used": False, "used_by": None, "used_at": None}
+                    ).eq("id_code", enrollment_id).eq("guild_id", guild_id).execute()
+                except Exception as exc:
+                    logger.warning(f"Could not free enrollment ID: {exc}")
+
+            logger.info(f"User {user_id} unenrolled from guild {guild_id}")
+            return True
+        except Exception as exc:
+            logger.error(f"unenroll_user: {exc}")
+            return False
+
+    async def mark_enrollment_used(self, user_id: int, guild_id: int) -> bool:
+        try:
+            self._get_client().table("enrollments").update(
+                {"enrollment_used": True}
+            ).eq("user_id", user_id).eq("guild_id", guild_id).execute()
+            return True
+        except Exception as exc:
+            logger.error(f"mark_enrollment_used: {exc}")
+            return False
+
+    # ─────────────────────────────────────────────
+    #  Progress Tracking
+    # ─────────────────────────────────────────────
+
+    async def get_user_progress(
+        self, user_id: int, guild_id: int
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            resp = (
+                self._get_client()
+                .table("enrollments")
+                .select("*")
+                .eq("user_id", user_id)
+                .eq("guild_id", guild_id)
+                .execute()
+            )
+            return resp.data[0] if resp.data else None
+        except Exception as exc:
+            logger.error(f"get_user_progress: {exc}")
+            return None
+
+    async def update_user_day(
+        self, user_id: int, guild_id: int, current_day: int
+    ) -> bool:
+        client = self._get_client()
+        try:
+            client.table("enrollments").update(
+                {
+                    "current_day": current_day,
+                    "last_message_sent": self._now(),
+                    "completed": current_day > config.TOTAL_DAYS,
+                }
+            ).eq("user_id", user_id).eq("guild_id", guild_id).execute()
+
+            # Append an analytics row
+            try:
+                client.table("daily_progress").insert(
+                    {
+                        "user_id": user_id,
+                        "guild_id": guild_id,
+                        "day_number": current_day,
+                        "completed_at": self._now(),
+                    }
+                ).execute()
+            except Exception as exc:
+                logger.warning(f"Could not log daily_progress: {exc}")
+
+            return True
+        except Exception as exc:
+            logger.error(f"update_user_day: {exc}")
+            return False
+
+    async def get_all_enrolled_users(self) -> List[Dict[str, Any]]:
+        """
+        Returns enrollments where the next daily message is due
+        (not completed, past the intro, last sent >= 24 h ago or never).
+        """
+        try:
+            resp = (
+                self._get_client()
+                .table("enrollments")
+                .select("*")
+                .eq("completed", False)
+                .gt("current_day", 1)  # Days 2-8 are sent by the task
+                .execute()
+            )
+
+            result = []
+            now = datetime.utcnow()
+
+            for row in resp.data or []:
+                last_sent = row.get("last_message_sent")
+                if not last_sent:
+                    result.append(row)
+                    continue
+                try:
+                    last_dt = datetime.fromisoformat(
+                        last_sent.replace("Z", "+00:00")
+                    ).replace(tzinfo=None)
+                    if (now - last_dt).total_seconds() >= 86400:
+                        result.append(row)
+                except Exception:
+                    result.append(row)  # Include if date can't be parsed
+
+            return result
+        except Exception as exc:
+            logger.error(f"get_all_enrolled_users: {exc}")
             return []
+
+    # ─────────────────────────────────────────────
+    #  Channel management
+    # ─────────────────────────────────────────────
+
+    async def save_channel_id(
+        self, user_id: int, guild_id: int, channel_id: int
+    ) -> bool:
+        """Store the private training channel ID on the enrollment row."""
+        try:
+            self._get_client().table("enrollments").update(
+                {"channel_id": channel_id}
+            ).eq("user_id", user_id).eq("guild_id", guild_id).execute()
+            logger.info(
+                f"Saved channel {channel_id} for user {user_id} in guild {guild_id}"
+            )
+            return True
+        except Exception as exc:
+            logger.error(f"save_channel_id: {exc}")
+            return False
+
+    # ─────────────────────────────────────────────
+    #  Guild Settings
+    # ─────────────────────────────────────────────
+
+    async def get_guild_settings(self, guild_id: int) -> Dict[str, Any]:
+        client = self._get_client()
+        try:
+            resp = (
+                client.table("guild_settings")
+                .select("*")
+                .eq("guild_id", guild_id)
+                .execute()
+            )
+            if resp.data:
+                return resp.data[0]
+
+            # First visit – create default row
+            defaults: Dict[str, Any] = {
+                "guild_id": guild_id,
+                "bot_enabled": True,
+                "category_id": None,
+                "role_id": None,
+                "created_at": self._now(),
+            }
+            try:
+                client.table("guild_settings").insert(defaults).execute()
+            except Exception as exc:
+                logger.warning(f"Could not insert default guild_settings: {exc}")
+            return defaults
+        except Exception as exc:
+            logger.error(f"get_guild_settings: {exc}")
+            return {"guild_id": guild_id, "bot_enabled": True}
+
+    async def toggle_bot(self, guild_id: int, enabled: bool) -> None:
+        try:
+            self._get_client().table("guild_settings").upsert(
+                {
+                    "guild_id": guild_id,
+                    "bot_enabled": enabled,
+                    "updated_at": self._now(),
+                }
+            ).execute()
+        except Exception as exc:
+            logger.error(f"toggle_bot: {exc}")
+
+    async def is_bot_enabled(self, guild_id: int) -> bool:
+        settings = await self.get_guild_settings(guild_id)
+        return settings.get("bot_enabled", True)
+
+    async def set_guild_config(
+        self,
+        guild_id: int,
+        category_id: Optional[int] = None,
+        role_id: Optional[int] = None,
+        log_channel_id: Optional[int] = None,
+    ) -> bool:
+        """Upsert category_id, role_id, and/or log_channel_id for a guild."""
+        try:
+            payload: Dict[str, Any] = {
+                "guild_id": guild_id,
+                "updated_at": self._now(),
+            }
+            if category_id is not None:
+                payload["category_id"] = category_id
+            if role_id is not None:
+                payload["role_id"] = role_id
+            if log_channel_id is not None:
+                payload["log_channel_id"] = log_channel_id
+
+            self._get_client().table("guild_settings").upsert(payload).execute()
+            logger.info(f"Guild config updated for {guild_id}: {payload}")
+            return True
+        except Exception as exc:
+            logger.error(f"set_guild_config: {exc}")
+            return False
+
+    # ─────────────────────────────────────────────
+    #  Statistics
+    # ─────────────────────────────────────────────
+
+    async def get_stats(self, guild_id: Optional[int] = None) -> Dict[str, Any]:
+        client = self._get_client()
+        try:
+
+            def _build(eq_completed: bool):
+                q = (
+                    client.table("enrollments")
+                    .select("*", count="exact")
+                    .eq("completed", eq_completed)
+                )
+                if guild_id:
+                    q = q.eq("guild_id", guild_id)
+                return q.execute()
+
+            total_resp = client.table("enrollments").select("*", count="exact")
+            if guild_id:
+                total_resp = total_resp.eq("guild_id", guild_id)
+            total_resp = total_resp.execute()
+
+            done_resp = _build(True)
+
+            total = (
+                total_resp.count
+                if hasattr(total_resp, "count")
+                else len(total_resp.data or [])
+            )
+            done = (
+                done_resp.count
+                if hasattr(done_resp, "count")
+                else len(done_resp.data or [])
+            )
+
+            return {
+                "total_enrolled": total,
+                "completed": done,
+                "in_progress": total - done,
+            }
+        except Exception as exc:
+            logger.error(f"get_stats: {exc}")
+            return {"total_enrolled": 0, "completed": 0, "in_progress": 0}

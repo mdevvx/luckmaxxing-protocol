@@ -1,8 +1,3 @@
-"""
-Comprehensive Diagnostic Script for Luckmaxxing Bot
-This will check EVERYTHING and give you a detailed report
-"""
-
 import os
 import sys
 from dotenv import load_dotenv

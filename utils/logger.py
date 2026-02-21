@@ -1,58 +1,69 @@
 import logging
 import os
 from logging.handlers import RotatingFileHandler
+
 import config
 
+# Emoji → text fallback map for Windows consoles that choke on UTF-8 emojis
+_EMOJI_MAP = {
+    "✅": "[OK]",
+    "❌": "[ERR]",
+    "⚠️": "[WARN]",
+    "🔧": "[SETUP]",
+    "🚀": "[START]",
+    "📥": "[JOIN]",
+    "📤": "[LEAVE]",
+}
 
-def setup_logger(name="luckmaxxing_bot"):
-    """
-    Set up logger with file and console handlers
 
-    Args:
-        name: Logger name
+def _strip_emojis(text: str) -> str:
+    for emoji, replacement in _EMOJI_MAP.items():
+        text = text.replace(emoji, replacement)
+    return text
 
-    Returns:
-        Configured logger instance
-    """
-    # Create logs directory if it doesn't exist
+
+class _EmojiSafeFormatter(logging.Formatter):
+    """Formatter that replaces known emojis so Windows consoles don't break."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        record.msg = _strip_emojis(str(record.msg))
+        return super().format(record)
+
+
+def setup_logger(name: str = "luckmaxxing_bot") -> logging.Logger:
     os.makedirs("logs", exist_ok=True)
 
-    # Create logger
-    logger = logging.getLogger(name)
-    logger.setLevel(getattr(logging, config.LOG_LEVEL))
+    log = logging.getLogger(name)
+    log.setLevel(getattr(logging, config.LOG_LEVEL, logging.INFO))
 
-    # Prevent duplicate handlers if logger already exists
-    if logger.handlers:
-        return logger
+    # Avoid duplicate handlers when the module is re-imported
+    if log.handlers:
+        return log
 
-    # Create formatters
-    detailed_formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s",
+    file_fmt = logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(funcName)s:%(lineno)d | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-
-    simple_formatter = logging.Formatter(
-        "%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S"
+    console_fmt = _EmojiSafeFormatter(
+        "%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%H:%M:%S",
     )
 
-    # File handler with rotation (10MB max, 5 backups)
-    file_handler = RotatingFileHandler(
-        config.LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5  # 10MB
+    # Rotating file – keeps up to 5 × 10 MB
+    fh = RotatingFileHandler(
+        config.LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
     )
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(detailed_formatter)
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(file_fmt)
 
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(simple_formatter)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(console_fmt)
 
-    # Add handlers to logger
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-
-    return logger
+    log.addHandler(fh)
+    log.addHandler(ch)
+    return log
 
 
-# Create default logger instance
+# Module-level singleton used throughout the project
 logger = setup_logger()
