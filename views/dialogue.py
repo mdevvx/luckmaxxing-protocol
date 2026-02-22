@@ -40,6 +40,7 @@ class DialogueView(discord.ui.View):
         self.user_id = user_id
         self.current_index: int = 0
         self.message: Optional[discord.Message] = None
+        self._completed = False
 
         self._render_buttons()
 
@@ -107,6 +108,8 @@ class DialogueView(discord.ui.View):
     async def _on_complete(self, interaction: discord.Interaction):
         await interaction.response.defer()
 
+        self._completed = True
+
         # Disable all buttons to signal finality
         for item in self.children:
             item.disabled = True  # type: ignore[attr-defined]
@@ -145,12 +148,14 @@ class DialogueView(discord.ui.View):
     # ──────────────────────────────────────────
 
     async def on_timeout(self):
+        if self._completed:  # ← add this guard
+            return
         for item in self.children:
-            item.disabled = True  # type: ignore[attr-defined]
+            item.disabled = True
         if self.message:
             try:
                 await self.message.edit(
-                    content="> Session timed out. The next day's content will arrive in 24 hours.",
+                    content="> Session timed out. Click the button below to resume when ready.",
                     view=self,
                 )
             except Exception:
