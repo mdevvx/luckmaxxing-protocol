@@ -341,7 +341,7 @@ class ProtocolCog(commands.Cog):
     #  Daily task
     # ──────────────────────────────────────────
 
-    @tasks.loop(hours=24)
+    @tasks.loop(hours=1)
     async def send_daily_messages(self):
         """Deliver the next day's content to every user whose 24 h window has elapsed."""
         logger.info("Daily message task starting...")
