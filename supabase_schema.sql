@@ -123,3 +123,5 @@ BEGIN
     RAISE NOTICE 'RLS: disabled on all tables';
     RAISE NOTICE '==============================================';
 END $$;
+
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS last_button_click TIMESTAMPTZ;
