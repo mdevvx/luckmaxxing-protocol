@@ -87,4 +87,7 @@ def create_enrollment_embed() -> discord.Embed:
         color=config.EMBED_COLOR,
     )
     embed.set_footer(text="Gorillions await you.")
+    embed.set_image(
+        url="https://cdn.discordapp.com/attachments/1474746304608473200/1501241764525375649/bot_banner.png?ex=69fb5bd8&is=69fa0a58&hm=91e56d6121d9557b6b42cc219ddf6102850d0e8c3dd23f62aaa8b505b23610d0&"
+    )
     return embed
