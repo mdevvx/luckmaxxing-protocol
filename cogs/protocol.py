@@ -558,6 +558,7 @@ from views.enrollment import EnrollmentView, create_enrollment_embed
 # ──────────────────────────────────────────────────────────────────
 
 _EST = pytz.timezone("America/New_York")
+_LEGACY_PROTOCOL_CHANNEL_NAMES = {"luxkmaxxing-protocol"}
 
 # Hours (EST) at which daily content is delivered
 _NOTIFY_HOURS = {9, 21}  # 9 AM and 9 PM
@@ -625,6 +626,16 @@ async def _get_training_channel(
         return None
 
 
+def _find_protocol_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    valid_names = {config.PROTOCOL_CHANNEL_NAME, *_LEGACY_PROTOCOL_CHANNEL_NAMES}
+    return discord.utils.find(lambda channel: channel.name in valid_names, guild.text_channels)
+
+
+def _protocol_channel_reference(guild: discord.Guild) -> str:
+    channel = _find_protocol_channel(guild)
+    return channel.mention if channel else f"#{config.PROTOCOL_CHANNEL_NAME}"
+
+
 # ──────────────────────────────────────────────────────────────────
 #  Cog
 # ──────────────────────────────────────────────────────────────────
@@ -649,6 +660,24 @@ class ProtocolCog(commands.Cog):
         self.send_daily_messages.cancel()
         await self.db.close()
         logger.info("Protocol cog unloaded")
+
+    async def _remove_onboarding_role(
+        self, guild: discord.Guild, user_id: int, reason: str
+    ) -> None:
+        settings = await self.db.get_guild_settings(guild.id)
+        role_id: int | None = settings.get("role_id")
+        if not role_id:
+            return
+
+        member = guild.get_member(user_id)
+        role = guild.get_role(role_id)
+        if not member or not role:
+            return
+
+        try:
+            await member.remove_roles(role, reason=reason)
+        except discord.Forbidden:
+            logger.warning(f"Missing permission to remove role {role_id}")
 
     # ──────────────────────────────────────────
     #  Enrollment handler
@@ -693,24 +722,17 @@ class ProtocolCog(commands.Cog):
                 )
             return
 
-        # ── Verify code ───────────────────────────────────────────
-        if not await self.db.verify_enrollment_id(enrollment_id, guild_id):
-            await interaction.response.send_message(
-                "**Invalid enrollment ID.**\n\n"
-                "The code is either not valid for this server, already used, or doesn't exist.\n"
-                "Contact an admin if you need a new one.",
-                ephemeral=True,
-            )
-            return
-
-        # ── Defer — channel creation may take a moment ────────────
+        # ── Defer — enrollment may touch the database and create channels ──
         await interaction.response.defer(ephemeral=True)
 
         # ── Enroll in DB ──────────────────────────────────────────
         enrolled = await self.db.enroll_user_with_id(user.id, guild_id, enrollment_id)
         if not enrolled:
             await interaction.followup.send(
-                "Enrollment failed — please try again.", ephemeral=True
+                "**Invalid enrollment ID.**\n\n"
+                "The code is either not valid for this server, already used, or doesn't exist.\n"
+                "Contact an admin if you need a new one.",
+                ephemeral=True,
             )
             return
 
@@ -720,11 +742,13 @@ class ProtocolCog(commands.Cog):
         role_id: int | None = settings.get("role_id")
 
         # ── Assign role ───────────────────────────────────────────
+        role_assigned = False
         if role_id:
             role = guild.get_role(role_id)
             if role:
                 try:
                     await user.add_roles(role, reason="Luckmaxxing enrollment")
+                    role_assigned = True
                     logger.info(f"Assigned role {role.name} to {user.id}")
                 except discord.Forbidden:
                     logger.warning(f"Missing permission to assign role {role_id}")
@@ -766,6 +790,10 @@ class ProtocolCog(commands.Cog):
                 ephemeral=True,
             )
             await self.db.unenroll_user(user.id, guild_id)
+            if role_assigned:
+                await self._remove_onboarding_role(
+                    guild, user.id, reason="Enrollment rollback after channel failure"
+                )
             return
         except Exception as exc:
             logger.error(f"Channel creation failed for {user.id}: {exc}")
@@ -774,6 +802,10 @@ class ProtocolCog(commands.Cog):
                 ephemeral=True,
             )
             await self.db.unenroll_user(user.id, guild_id)
+            if role_assigned:
+                await self._remove_onboarding_role(
+                    guild, user.id, reason="Enrollment rollback after channel failure"
+                )
             return
 
         # ── Persist channel ID ────────────────────────────────────
@@ -954,7 +986,7 @@ class ProtocolCog(commands.Cog):
                             "**Inactivity detected.**\n\n"
                             "You have been inactive for 24 hours and have been removed "
                             "from the Luckmaxxing Protocol. Re-enroll in "
-                            f"<#{config.PROTOCOL_CHANNEL_NAME}> to start again from Day 1."
+                            f"{_protocol_channel_reference(guild)} to start again from Day 1."
                         )
                     except Exception as exc:
                         logger.warning(
@@ -1097,9 +1129,18 @@ class ProtocolCog(commands.Cog):
         if not await self._check_configured(interaction):
             return
 
-        channel = discord.utils.get(
-            interaction.guild.text_channels, name=config.PROTOCOL_CHANNEL_NAME
-        )
+        channel = _find_protocol_channel(interaction.guild)
+        if channel and channel.name != config.PROTOCOL_CHANNEL_NAME:
+            try:
+                await channel.edit(
+                    name=config.PROTOCOL_CHANNEL_NAME,
+                    reason="Rename legacy protocol channel typo",
+                )
+            except discord.Forbidden:
+                logger.warning(
+                    f"Could not rename legacy protocol channel in guild {interaction.guild.id}"
+                )
+
         if not channel:
             try:
                 channel = await interaction.guild.create_text_channel(

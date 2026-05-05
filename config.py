@@ -13,7 +13,8 @@ SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
 
 # ── Bot settings ─────────────────────────────────────────────────
 TOTAL_DAYS: int = 8
-PROTOCOL_CHANNEL_NAME: str = "luxkmaxxing-protocol"
+PROTOCOL_CHANNEL_NAME: str = "luckmaxxing-protocol"
+GRADUATE_ROLE_NAME: str = "Luckmaxxed Gamblor"
 
 # ── Logging ──────────────────────────────────────────────────────
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

@@ -48,6 +48,24 @@ class AdminCog(commands.Cog):
             return False
         return True
 
+    async def _remove_onboarding_role(
+        self, guild: discord.Guild, user_id: int, reason: str
+    ) -> None:
+        settings = await self.db.get_guild_settings(guild.id)
+        role_id: int | None = settings.get("role_id")
+        if not role_id:
+            return
+
+        member = guild.get_member(user_id)
+        role = guild.get_role(role_id)
+        if not member or not role:
+            return
+
+        try:
+            await member.remove_roles(role, reason=reason)
+        except discord.Forbidden:
+            logger.warning(f"Could not remove role {role_id} from {user_id}")
+
     # ──────────────────────────────────────────
     #  /configure
     # ──────────────────────────────────────────
@@ -254,6 +272,12 @@ class AdminCog(commands.Cog):
                     )
                 except discord.Forbidden:
                     logger.warning(f"Could not delete channel {channel_id}")
+
+        await self._remove_onboarding_role(
+            interaction.guild,
+            user.id,
+            reason=f"Unenrolled by admin {interaction.user}",
+        )
 
         await interaction.followup.send(
             f"{user.mention} has been unenrolled and their training channel removed."

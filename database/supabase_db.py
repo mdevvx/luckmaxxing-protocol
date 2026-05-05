@@ -492,6 +492,16 @@ class SupabaseDatabase(DatabaseBase):
     def _now() -> str:
         return datetime.utcnow().isoformat()
 
+    def _release_enrollment_id(
+        self, enrollment_id: str, guild_id: int, user_id: int
+    ) -> None:
+        """Release an unconsumed code if it is still claimed by this user."""
+        self._get_client().table("enrollment_ids").update(
+            {"used": False, "used_by": None, "used_at": None}
+        ).eq("id_code", enrollment_id).eq("guild_id", guild_id).eq(
+            "used_by", user_id
+        ).execute()
+
     # ─────────────────────────────────────────────
     #  Lifecycle
     # ─────────────────────────────────────────────
@@ -594,6 +604,28 @@ class SupabaseDatabase(DatabaseBase):
         client = self._get_client()
         try:
             now = self._now()
+            claim_resp = (
+                client.table("enrollment_ids")
+                .update(
+                    {
+                        "used": True,
+                        "used_by": user_id,
+                        "used_at": now,
+                    }
+                )
+                .eq("id_code", enrollment_id)
+                .eq("guild_id", guild_id)
+                .eq("used", False)
+                .select("id")
+                .execute()
+            )
+
+            if not claim_resp.data:
+                logger.warning(
+                    f"Enrollment ID {enrollment_id} could not be claimed for guild {guild_id}"
+                )
+                return False
+
             client.table("enrollments").insert(
                 {
                     "user_id": user_id,
@@ -608,17 +640,16 @@ class SupabaseDatabase(DatabaseBase):
                 }
             ).execute()
 
-            client.table("enrollment_ids").update(
-                {
-                    "used": True,
-                    "used_by": user_id,
-                    "used_at": now,
-                }
-            ).eq("id_code", enrollment_id).eq("guild_id", guild_id).execute()
-
             logger.info(f"User {user_id} enrolled in guild {guild_id}")
             return True
         except Exception as exc:
+            try:
+                self._release_enrollment_id(enrollment_id, guild_id, user_id)
+            except Exception as release_exc:
+                logger.warning(
+                    f"Could not release enrollment ID {enrollment_id}: {release_exc}"
+                )
+
             msg = str(exc).lower()
             if "duplicate" in msg or "unique" in msg:
                 logger.warning(f"User {user_id} already enrolled in guild {guild_id}")
@@ -630,7 +661,11 @@ class SupabaseDatabase(DatabaseBase):
         client = self._get_client()
         try:
             row = await self.get_user_progress(user_id, guild_id)
-            enrollment_id = row.get("enrollment_id") if row else None
+            if not row:
+                return False
+
+            enrollment_id = row.get("enrollment_id")
+            enrollment_used = row.get("enrollment_used", False)
 
             try:
                 client.table("daily_progress").delete().eq("user_id", user_id).eq(
@@ -643,11 +678,9 @@ class SupabaseDatabase(DatabaseBase):
                 "guild_id", guild_id
             ).execute()
 
-            if enrollment_id:
+            if enrollment_id and not enrollment_used:
                 try:
-                    client.table("enrollment_ids").update(
-                        {"used": False, "used_by": None, "used_at": None}
-                    ).eq("id_code", enrollment_id).eq("guild_id", guild_id).execute()
+                    self._release_enrollment_id(enrollment_id, guild_id, user_id)
                 except Exception as exc:
                     logger.warning(f"Could not free enrollment ID: {exc}")
 
@@ -693,6 +726,7 @@ class SupabaseDatabase(DatabaseBase):
     ) -> bool:
         client = self._get_client()
         try:
+            completed_day = max(1, min(current_day - 1, config.TOTAL_DAYS))
             client.table("enrollments").update(
                 {
                     "current_day": current_day,
@@ -706,7 +740,7 @@ class SupabaseDatabase(DatabaseBase):
                     {
                         "user_id": user_id,
                         "guild_id": guild_id,
-                        "day_number": current_day,
+                        "day_number": completed_day,
                         "completed_at": self._now(),
                     }
                 ).execute()
@@ -818,12 +852,29 @@ class SupabaseDatabase(DatabaseBase):
             logger.error(f"get_all_enrolled_users: {exc}")
             return []
 
+    async def get_enrollment_by_channel(
+        self, guild_id: int, channel_id: int
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            resp = (
+                self._get_client()
+                .table("enrollments")
+                .select("*")
+                .eq("guild_id", guild_id)
+                .eq("channel_id", channel_id)
+                .execute()
+            )
+            return resp.data[0] if resp.data else None
+        except Exception as exc:
+            logger.error(f"get_enrollment_by_channel: {exc}")
+            return None
+
     # ─────────────────────────────────────────────
     #  Channel management
     # ─────────────────────────────────────────────
 
     async def save_channel_id(
-        self, user_id: int, guild_id: int, channel_id: int
+        self, user_id: int, guild_id: int, channel_id: Optional[int]
     ) -> bool:
         try:
             self._get_client().table("enrollments").update(
