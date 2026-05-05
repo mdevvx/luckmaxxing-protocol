@@ -60,7 +60,7 @@ class LuckmaxxingBot(commands.Bot):
                 description=(
                     "Ready to transform your members into statistical anomalies.\n\n"
                     "**Quick start**\n"
-                    "1. `/configure role:<role> category:<category>` — set the onboarding role and channel category\n"
+                    "1. `/configure role:<role> completion_role:<role> category:<category>` — set enrollment role, completion role, and channel category\n"
                     "2. `/setup` — post the enrollment message\n"
                     "3. `/generateid count:10` — create enrollment codes for your members\n\n"
                     "Gorillions await."

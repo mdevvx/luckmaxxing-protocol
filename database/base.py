@@ -93,6 +93,7 @@ class DatabaseBase(ABC):
         guild_id: int,
         category_id: Optional[int] = None,
         role_id: Optional[int] = None,
+        completion_role_id: Optional[int] = None,
         log_channel_id: Optional[int] = None,
     ) -> bool:
         pass

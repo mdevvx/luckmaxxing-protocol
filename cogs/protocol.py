@@ -726,7 +726,18 @@ class ProtocolCog(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         # ── Enroll in DB ──────────────────────────────────────────
-        enrolled = await self.db.enroll_user_with_id(user.id, guild_id, enrollment_id)
+        # enroll_user_with_id returns False for an invalid/used ID,
+        # and raises an exception for an internal DB error.
+        try:
+            enrolled = await self.db.enroll_user_with_id(user.id, guild_id, enrollment_id)
+        except Exception as exc:
+            logger.error(f"DB error enrolling user {user.id}: {exc}")
+            await interaction.followup.send(
+                "Enrollment failed due to an internal error. Please try again.",
+                ephemeral=True,
+            )
+            return
+
         if not enrolled:
             await interaction.followup.send(
                 "**Invalid enrollment ID.**\n\n"
@@ -741,7 +752,7 @@ class ProtocolCog(commands.Cog):
         category_id: int | None = settings.get("category_id")
         role_id: int | None = settings.get("role_id")
 
-        # ── Assign role ───────────────────────────────────────────
+        # ── Assign enrollment role ────────────────────────────────
         role_assigned = False
         if role_id:
             role = guild.get_role(role_id)
@@ -749,11 +760,11 @@ class ProtocolCog(commands.Cog):
                 try:
                     await user.add_roles(role, reason="Luckmaxxing enrollment")
                     role_assigned = True
-                    logger.info(f"Assigned role {role.name} to {user.id}")
+                    logger.info(f"Assigned enrollment role {role.name} to {user.id}")
                 except discord.Forbidden:
                     logger.warning(f"Missing permission to assign role {role_id}")
             else:
-                logger.warning(f"Role {role_id} not found in guild {guild_id}")
+                logger.warning(f"Enrollment role {role_id} not found in guild {guild_id}")
 
         # ── Create private training channel ───────────────────────
         category = guild.get_channel(category_id) if category_id else None
@@ -900,6 +911,27 @@ class ProtocolCog(commands.Cog):
                     "You are no longer average. You are now a **statistical anomaly**.\n\n"
                     "Gorillions await you."
                 )
+                # Swap roles: remove enrollment role, assign completion role
+                settings = await self.db.get_guild_settings(guild_id)
+                enroll_role_id: int | None = settings.get("role_id")
+                completion_role_id: int | None = settings.get("completion_role_id")
+                member = guild.get_member(user.id)
+                if member:
+                    if enroll_role_id:
+                        enroll_role = guild.get_role(enroll_role_id)
+                        if enroll_role:
+                            try:
+                                await member.remove_roles(enroll_role, reason="Training complete — role swap")
+                            except discord.Forbidden:
+                                logger.warning(f"Missing permission to remove enrollment role {enroll_role_id}")
+                    if completion_role_id:
+                        comp_role = guild.get_role(completion_role_id)
+                        if comp_role:
+                            try:
+                                await member.add_roles(comp_role, reason="Luckmaxxing training complete")
+                                logger.info(f"Assigned completion role {comp_role.name} to {user.id}")
+                            except discord.Forbidden:
+                                logger.warning(f"Missing permission to assign completion role {completion_role_id}")
                 await self.bot_log.training_complete(guild, user)
                 logger.info(f"User {user.id} completed training in guild {guild_id}")
             else:
@@ -1089,6 +1121,7 @@ class ProtocolCog(commands.Cog):
         settings = await self.db.get_guild_settings(interaction.guild.id)
         category_id = settings.get("category_id")
         role_id = settings.get("role_id")
+        completion_role_id = settings.get("completion_role_id")
 
         missing = []
         if not category_id:
@@ -1096,7 +1129,9 @@ class ProtocolCog(commands.Cog):
                 "**Training category** — where private channels will be created"
             )
         if not role_id:
-            missing.append("**Onboarding role** — assigned to users when they enroll")
+            missing.append("**Enrollment role** — assigned to users when they enroll")
+        if not completion_role_id:
+            missing.append("**Completion role** — assigned to users when they finish training")
 
         if missing:
             embed = discord.Embed(
@@ -1105,8 +1140,8 @@ class ProtocolCog(commands.Cog):
                     "Before running `/setup` you must configure this server.\n\n"
                     "**Missing:**\n" + "\n".join(f"• {m}" for m in missing) + "\n\n"
                     "**Run this command first:**\n"
-                    "```\n/configure role:<role> category:<category>\n```\n"
-                    "Both options can be set together or one at a time."
+                    "```\n/configure role:<role> completion_role:<role> category:<category>\n```\n"
+                    "All options can be set together or one at a time."
                 ),
                 color=config.EMBED_COLOR,
             )

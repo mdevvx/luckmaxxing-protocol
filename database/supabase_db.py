@@ -507,6 +507,8 @@ class SupabaseDatabase(DatabaseBase):
     # ─────────────────────────────────────────────
 
     async def initialize(self) -> None:
+        if self._initialized:
+            return
         try:
             if self.client is None:
                 self.client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
@@ -520,6 +522,8 @@ class SupabaseDatabase(DatabaseBase):
             raise
 
     async def close(self) -> None:
+        if not self._initialized:
+            return
         self._initialized = False
         self.client = None
         logger.info("Supabase connection closed")
@@ -578,7 +582,7 @@ class SupabaseDatabase(DatabaseBase):
             resp = (
                 self._get_client()
                 .table("enrollment_ids")
-                .select("id")
+                .select("id_code")
                 .eq("id_code", enrollment_id)
                 .eq("guild_id", guild_id)
                 .eq("used", False)
@@ -602,30 +606,33 @@ class SupabaseDatabase(DatabaseBase):
         self, user_id: int, guild_id: int, enrollment_id: str
     ) -> bool:
         client = self._get_client()
+        now = self._now()
+
+        # Step 1: Atomically claim the enrollment ID.
+        # Returns False (not an exception) if the ID is invalid, used, or wrong guild.
         try:
-            now = self._now()
             claim_resp = (
                 client.table("enrollment_ids")
-                .update(
-                    {
-                        "used": True,
-                        "used_by": user_id,
-                        "used_at": now,
-                    }
-                )
+                .update({"used": True, "used_by": user_id, "used_at": now})
                 .eq("id_code", enrollment_id)
                 .eq("guild_id", guild_id)
                 .eq("used", False)
-                .select("id")
                 .execute()
             )
+        except Exception as exc:
+            logger.error(f"enroll_user_with_id claim step: {exc}")
+            return False
 
-            if not claim_resp.data:
-                logger.warning(
-                    f"Enrollment ID {enrollment_id} could not be claimed for guild {guild_id}"
-                )
-                return False
+        if not claim_resp.data:
+            logger.warning(
+                f"Enrollment ID {enrollment_id} not found / already used for guild {guild_id}"
+            )
+            return False
 
+        # Step 2: Create the enrollment row.
+        # On failure, release the claimed ID and re-raise so the caller can show
+        # a "DB error, try again" message rather than "invalid ID".
+        try:
             client.table("enrollments").insert(
                 {
                     "user_id": user_id,
@@ -635,11 +642,9 @@ class SupabaseDatabase(DatabaseBase):
                     "current_day": 0,
                     "channel_id": None,
                     "enrolled_at": now,
-                    # Seed last_button_click so the 24h window starts from enrollment
                     "last_button_click": now,
                 }
             ).execute()
-
             logger.info(f"User {user_id} enrolled in guild {guild_id}")
             return True
         except Exception as exc:
@@ -649,13 +654,12 @@ class SupabaseDatabase(DatabaseBase):
                 logger.warning(
                     f"Could not release enrollment ID {enrollment_id}: {release_exc}"
                 )
-
             msg = str(exc).lower()
             if "duplicate" in msg or "unique" in msg:
                 logger.warning(f"User {user_id} already enrolled in guild {guild_id}")
             else:
-                logger.error(f"enroll_user_with_id: {exc}")
-            return False
+                logger.error(f"enroll_user_with_id insert step: {exc}")
+            raise
 
     async def unenroll_user(self, user_id: int, guild_id: int) -> bool:
         client = self._get_client()
@@ -909,6 +913,7 @@ class SupabaseDatabase(DatabaseBase):
                 "bot_enabled": True,
                 "category_id": None,
                 "role_id": None,
+                "completion_role_id": None,
                 "created_at": self._now(),
             }
             try:
@@ -941,6 +946,7 @@ class SupabaseDatabase(DatabaseBase):
         guild_id: int,
         category_id: Optional[int] = None,
         role_id: Optional[int] = None,
+        completion_role_id: Optional[int] = None,
         log_channel_id: Optional[int] = None,
     ) -> bool:
         try:
@@ -952,6 +958,8 @@ class SupabaseDatabase(DatabaseBase):
                 payload["category_id"] = category_id
             if role_id is not None:
                 payload["role_id"] = role_id
+            if completion_role_id is not None:
+                payload["completion_role_id"] = completion_role_id
             if log_channel_id is not None:
                 payload["log_channel_id"] = log_channel_id
 

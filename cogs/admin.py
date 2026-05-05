@@ -48,23 +48,30 @@ class AdminCog(commands.Cog):
             return False
         return True
 
-    async def _remove_onboarding_role(
+    async def _remove_protocol_roles(
         self, guild: discord.Guild, user_id: int, reason: str
     ) -> None:
+        """Remove both enrollment and completion roles from a user (whichever they have)."""
         settings = await self.db.get_guild_settings(guild.id)
-        role_id: int | None = settings.get("role_id")
-        if not role_id:
+        member = guild.get_member(user_id)
+        if not member:
             return
 
-        member = guild.get_member(user_id)
-        role = guild.get_role(role_id)
-        if not member or not role:
+        roles_to_remove = []
+        for key in ("role_id", "completion_role_id"):
+            rid = settings.get(key)
+            if rid:
+                role = guild.get_role(rid)
+                if role and role in member.roles:
+                    roles_to_remove.append(role)
+
+        if not roles_to_remove:
             return
 
         try:
-            await member.remove_roles(role, reason=reason)
+            await member.remove_roles(*roles_to_remove, reason=reason)
         except discord.Forbidden:
-            logger.warning(f"Could not remove role {role_id} from {user_id}")
+            logger.warning(f"Could not remove protocol roles from {user_id}")
 
     # ──────────────────────────────────────────
     #  /configure
@@ -72,11 +79,12 @@ class AdminCog(commands.Cog):
 
     @app_commands.command(
         name="configure",
-        description="Set training category, onboarding role, and log channel (Admin only)",
+        description="Set training category, enrollment role, completion role, and log channel (Admin only)",
     )
     @app_commands.describe(
         category="Category where private training channels will be created",
-        role="Role assigned to users when they enroll (e.g. Baby Gamblor)",
+        role="Role assigned to users when they enroll",
+        completion_role="Role assigned to users when they finish all training days",
         log_channel="Channel where the bot posts activity logs",
     )
     @app_commands.default_permissions(administrator=True)
@@ -85,13 +93,14 @@ class AdminCog(commands.Cog):
         interaction: discord.Interaction,
         category: Optional[discord.CategoryChannel] = None,
         role: Optional[discord.Role] = None,
+        completion_role: Optional[discord.Role] = None,
         log_channel: Optional[discord.TextChannel] = None,
     ):
-        """Persist category, role, and/or log channel for this guild."""
+        """Persist category, roles, and/or log channel for this guild."""
         # /configure is allowed even when disabled so admins can finish setup first
-        if category is None and role is None and log_channel is None:
+        if category is None and role is None and completion_role is None and log_channel is None:
             await interaction.response.send_message(
-                "Provide at least one option: `category`, `role`, or `log_channel`.",
+                "Provide at least one option: `category`, `role`, `completion_role`, or `log_channel`.",
                 ephemeral=True,
             )
             return
@@ -102,6 +111,7 @@ class AdminCog(commands.Cog):
             interaction.guild.id,
             category_id=category.id if category else None,
             role_id=role.id if role else None,
+            completion_role_id=completion_role.id if completion_role else None,
             log_channel_id=log_channel.id if log_channel else None,
         )
 
@@ -115,7 +125,9 @@ class AdminCog(commands.Cog):
         if category:
             lines.append(f"**Training category:** {category.name}")
         if role:
-            lines.append(f"**Onboarding role:** {role.mention}")
+            lines.append(f"**Enrollment role:** {role.mention}")
+        if completion_role:
+            lines.append(f"**Completion role:** {completion_role.mention}")
         if log_channel:
             lines.append(f"**Log channel:** {log_channel.mention}")
 
@@ -134,6 +146,7 @@ class AdminCog(commands.Cog):
             f"Guild {interaction.guild.id} configured — "
             f"category={category.id if category else None}, "
             f"role={role.id if role else None}, "
+            f"completion_role={completion_role.id if completion_role else None}, "
             f"log_channel={log_channel.id if log_channel else None}"
         )
 
@@ -162,7 +175,7 @@ class AdminCog(commands.Cog):
         embed = discord.Embed(
             title="Bot Status Updated",
             description=f"The Luckmaxxing Protocol is now **{label}** in this server.",
-            color=config.EMBED_COLOR if enabled else config.EMBED_COLOR,
+            color=config.EMBED_COLOR if enabled else discord.Color.red(),
         )
         await interaction.followup.send(embed=embed)
         await self.bot_log.bot_toggled(interaction.guild, interaction.user, enabled)
@@ -273,7 +286,7 @@ class AdminCog(commands.Cog):
                 except discord.Forbidden:
                     logger.warning(f"Could not delete channel {channel_id}")
 
-        await self._remove_onboarding_role(
+        await self._remove_protocol_roles(
             interaction.guild,
             user.id,
             reason=f"Unenrolled by admin {interaction.user}",
@@ -332,6 +345,7 @@ class AdminCog(commands.Cog):
         bot_status = "Enabled" if settings.get("bot_enabled", True) else "Disabled"
         category_id = settings.get("category_id")
         role_id = settings.get("role_id")
+        completion_role_id = settings.get("completion_role_id")
         log_channel_id = settings.get("log_channel_id")
 
         category_label = (
@@ -342,6 +356,11 @@ class AdminCog(commands.Cog):
         role_label = (
             interaction.guild.get_role(role_id).name
             if role_id and interaction.guild.get_role(role_id)
+            else "Not set"
+        )
+        completion_role_label = (
+            interaction.guild.get_role(completion_role_id).name
+            if completion_role_id and interaction.guild.get_role(completion_role_id)
             else "Not set"
         )
         log_label = (
@@ -357,7 +376,8 @@ class AdminCog(commands.Cog):
         )
         embed.add_field(name="Servers", value=len(self.bot.guilds), inline=True)
         embed.add_field(name="Training Category", value=category_label, inline=True)
-        embed.add_field(name="Onboarding Role", value=role_label, inline=True)
+        embed.add_field(name="Enrollment Role", value=role_label, inline=True)
+        embed.add_field(name="Completion Role", value=completion_role_label, inline=True)
         embed.add_field(name="Log Channel", value=log_label, inline=True)
         embed.set_footer(text=f"Bot ID: {self.bot.user.id}")
         await interaction.followup.send(embed=embed)
