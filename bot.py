@@ -6,7 +6,9 @@ import discord
 from discord.ext import commands
 
 import config
+from database import get_database
 from utils.logger import logger
+from views.graduation import GraduationActionsView
 
 
 class LuckmaxxingBot(commands.Bot):
@@ -38,6 +40,9 @@ class LuckmaxxingBot(commands.Bot):
                 logger.info(f"Loaded extension: {ext}")
             except Exception as exc:
                 logger.error(f"Failed to load {ext}: {exc}", exc_info=True)
+
+        # Register persistent views so graduation buttons survive bot restarts
+        self.add_view(GraduationActionsView(get_database()))
 
     async def on_ready(self):
         logger.info(f"Logged in as {self.user} (ID: {self.user.id})")

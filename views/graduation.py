@@ -130,7 +130,7 @@ class GraduationActionsView(discord.ui.View):
             )
 
     @discord.ui.button(
-        label="Chief, me has question / feedback.",
+        label="Chief, me have question / feedback.",
         style=discord.ButtonStyle.success,
         custom_id=_KEEP_OPEN_BUTTON_ID,
     )

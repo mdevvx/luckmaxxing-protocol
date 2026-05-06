@@ -14,6 +14,7 @@ from utils.bot_logger import BotLogger
 from utils.logger import logger
 from views.dialogue import DialogueView
 from views.enrollment import EnrollmentView, create_enrollment_embed
+from views.graduation import GraduationActionsView, create_graduation_embed
 
 # ──────────────────────────────────────────────────────────────────
 #  Constants
@@ -410,6 +411,11 @@ class ProtocolCog(commands.Cog):
                                 logger.warning(
                                     f"Missing permission to assign completion role {completion_role_id}"
                                 )
+                grad_view = GraduationActionsView(self.db)
+                await channel.send(
+                    embed=create_graduation_embed(user),
+                    view=grad_view,
+                )
                 await self.bot_log.training_complete(guild, user)
                 logger.info(f"User {user.id} completed training in guild {guild_id}")
             else:
@@ -487,7 +493,7 @@ class ProtocolCog(commands.Cog):
             if not guild:
                 continue
 
-            # Notify before deleting
+            # Notify in the channel — do NOT delete it
             if channel_id:
                 channel = guild.get_channel(channel_id)
                 if channel:
@@ -502,10 +508,6 @@ class ProtocolCog(commands.Cog):
                         logger.warning(
                             f"Could not notify inactive user {user_id}: {exc}"
                         )
-                    try:
-                        await channel.delete(reason="Inactivity boot")
-                    except Exception as exc:
-                        logger.warning(f"Could not delete channel for {user_id}: {exc}")
 
             # Remove role
             settings = await self.db.get_guild_settings(guild_id)
@@ -534,20 +536,22 @@ class ProtocolCog(commands.Cog):
     async def send_daily_messages(self):
         """
         Every 30 minutes:
-        1. Boot users inactive for 24+ hours.
-        2. If the current EST time is within the 9 AM or 9 PM window,
-           deliver the next day's content to eligible users.
+        1. Deliver next-day content to users whose 24-hour window has elapsed.
+           Delivery resets last_button_click so the inactivity timer restarts.
+        2. Boot users who received content but haven't interacted for 24+ hours.
         """
-        # Always run inactivity checks regardless of notification window
+        # Step 1: deliver first so users due for Day N+1 aren't wrongly booted
+        await self._deliver_daily_content()
+        # Step 2: boot only truly inactive users (received content, never interacted)
         await self._boot_inactive_users()
 
-        if not _in_notify_window():
-            logger.debug("Not in notification window — skipping daily delivery")
+    async def _deliver_daily_content(self):
+        """Send next-day training to every user whose 24-hour window has elapsed."""
+        enrollments = await self.db.get_all_enrolled_users()
+        if not enrollments:
             return
 
-        logger.info("Notification window active — starting daily delivery")
-        enrollments = await self.db.get_all_enrolled_users()
-        logger.info(f"{len(enrollments)} users due for a message")
+        logger.info(f"Daily delivery — {len(enrollments)} user(s) due")
 
         for row in enrollments:
             user_id: int = row["user_id"]
@@ -564,14 +568,17 @@ class ProtocolCog(commands.Cog):
             try:
                 user = await self.bot.fetch_user(user_id)
                 await self.send_day_content(user, guild_id, day)
+                # Reset inactivity timer from delivery time so user gets a fresh
+                # 24-hour window to interact with today's content
+                await self.db.update_last_button_click(user_id, guild_id)
                 guild = self.bot.get_guild(guild_id)
                 if guild:
                     await self.bot_log.daily_delivery(guild, user, day)
                 logger.info(f"Sent day {day} to user {user_id}")
             except discord.NotFound:
-                logger.warning(f"User {user_id} not found")
+                logger.warning(f"User {user_id} not found — skipping")
             except Exception as exc:
-                logger.error(f"Error sending daily content to {user_id}: {exc}")
+                logger.error(f"Error sending daily content to {user_id}: {exc}", exc_info=True)
 
             await asyncio.sleep(0.5)  # Be polite to the rate-limiter
 
