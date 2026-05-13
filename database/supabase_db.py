@@ -856,6 +856,94 @@ class SupabaseDatabase(DatabaseBase):
             logger.error(f"get_all_enrolled_users: {exc}")
             return []
 
+    async def update_content_delivered(self, user_id: int, guild_id: int) -> bool:
+        """
+        Called when a day's dialogue is freshly delivered.
+        Sets last_content_delivered_at + last_message_sent to now and resets daily_alert_count.
+        Does NOT touch last_button_click so alerts can detect "no user response since delivery".
+        """
+        try:
+            now = self._now()
+            self._get_client().table("enrollments").update(
+                {
+                    "last_content_delivered_at": now,
+                    "last_message_sent": now,
+                    "daily_alert_count": 0,
+                }
+            ).eq("user_id", user_id).eq("guild_id", guild_id).execute()
+            return True
+        except Exception as exc:
+            logger.error(f"update_content_delivered: {exc}")
+            return False
+
+    async def update_alert_count(self, user_id: int, guild_id: int, count: int) -> bool:
+        try:
+            self._get_client().table("enrollments").update(
+                {"daily_alert_count": count}
+            ).eq("user_id", user_id).eq("guild_id", guild_id).execute()
+            return True
+        except Exception as exc:
+            logger.error(f"update_alert_count: {exc}")
+            return False
+
+    async def get_users_needing_alert(
+        self, min_seconds: int, alert_count: int
+    ) -> List[Dict[str, Any]]:
+        """
+        Return non-completed users (day >= 2) whose:
+        - daily_alert_count == alert_count  (hasn't had this alert yet)
+        - last_content_delivered_at >= min_seconds ago
+        - last_button_click is NULL or before last_content_delivered_at
+          (user hasn't responded since delivery)
+        """
+        try:
+            resp = (
+                self._get_client()
+                .table("enrollments")
+                .select("*")
+                .eq("completed", False)
+                .gte("current_day", 2)
+                .eq("daily_alert_count", alert_count)
+                .execute()
+            )
+
+            result = []
+            now = datetime.utcnow()
+
+            for row in resp.data or []:
+                delivered_at = row.get("last_content_delivered_at")
+                if not delivered_at:
+                    continue
+
+                try:
+                    delivered_dt = datetime.fromisoformat(
+                        delivered_at.replace("Z", "+00:00")
+                    ).replace(tzinfo=None)
+                except Exception:
+                    continue
+
+                if (now - delivered_dt).total_seconds() < min_seconds:
+                    continue
+
+                # Skip if user has clicked a button after delivery
+                last_click = row.get("last_button_click")
+                if last_click:
+                    try:
+                        click_dt = datetime.fromisoformat(
+                            last_click.replace("Z", "+00:00")
+                        ).replace(tzinfo=None)
+                        if click_dt > delivered_dt:
+                            continue
+                    except Exception:
+                        pass
+
+                result.append(row)
+
+            return result
+        except Exception as exc:
+            logger.error(f"get_users_needing_alert: {exc}")
+            return []
+
     async def get_enrollment_by_channel(
         self, guild_id: int, channel_id: int
     ) -> Optional[Dict[str, Any]]:

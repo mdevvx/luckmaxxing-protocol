@@ -29,6 +29,10 @@ _NOTIFY_HOURS = {9, 21}  # 9 AM and 9 PM
 # How many minutes either side of the target hour counts as "in window"
 _WINDOW_MINUTES = 15
 
+# Seconds after delivery before each inactivity alert fires
+_ALERT1_SECONDS = 8 * 3600   # first reminder at 8 h
+_ALERT2_SECONDS = 16 * 3600  # final reminder at 16 h (also disables the button)
+
 
 # ──────────────────────────────────────────────────────────────────
 #  Helpers
@@ -65,8 +69,8 @@ def _onboarding_embed(user: discord.Member) -> discord.Embed:
             "• Days 2–8 are posted automatically every 24 hours.\n\n"
             "**Daily mantra** — repeat before sunrise and before any high-risk activity:\n"
             "> *I am lucky. I am the luck.*\n\n"
-            "**Warning:** If you go 24 hours without interacting, you will be removed from "
-            "the training and must re-enroll from Day 1.\n\n"
+            "**Warning:** If you don't complete a day's training, you'll receive two reminders. "
+            "After the second reminder the session closes and that day's content will reappear the next day.\n\n"
             "Gorillions await you."
         ),
         color=config.EMBED_COLOR,
@@ -475,58 +479,119 @@ class ProtocolCog(commands.Cog):
         view.message = msg
 
     # ──────────────────────────────────────────
-    #  Inactivity boot
+    #  Daily alerts (replaces inactivity boot)
     # ──────────────────────────────────────────
 
-    async def _boot_inactive_users(self):
+    async def _disable_active_dialogue_button(
+        self, channel: discord.TextChannel
+    ) -> None:
         """
-        Remove users who haven't clicked any button in the last 24 hours.
-        Called at the start of every task loop tick.
+        Find the most recent bot message in the channel that has an enabled button
+        and replace its view with a fully-disabled version.
         """
-        inactive = await self.db.get_inactive_users(seconds=86400)
-        for row in inactive:
-            user_id: int = row["user_id"]
-            guild_id: int = row["guild_id"]
-            channel_id: int | None = row.get("channel_id")
+        try:
+            async for message in channel.history(limit=30):
+                if message.author.id != self.bot.user.id:
+                    continue
+                if not message.components:
+                    continue
 
-            guild = self.bot.get_guild(guild_id)
-            if not guild:
-                continue
+                for action_row in message.components:
+                    for component in action_row.children:
+                        if getattr(component, "disabled", True):
+                            continue
+                        # Rebuild the button as disabled
+                        style = getattr(component, "style", discord.ButtonStyle.secondary)
+                        if not isinstance(style, discord.ButtonStyle):
+                            try:
+                                style = discord.ButtonStyle(int(style))
+                            except (ValueError, TypeError):
+                                style = discord.ButtonStyle.secondary
 
-            # Notify in the channel — do NOT delete it
-            if channel_id:
-                channel = guild.get_channel(channel_id)
-                if channel:
-                    try:
-                        await channel.send(
-                            "**Inactivity detected.**\n\n"
-                            "You have been inactive for 24 hours and have been removed "
-                            "from the Luckmaxxing Protocol. Re-enroll in "
-                            f"{_protocol_channel_reference(guild)} to start again from Day 1."
+                        disabled_view = discord.ui.View(timeout=None)
+                        btn = discord.ui.Button(
+                            label=getattr(component, "label", "...") or "...",
+                            style=style,
+                            disabled=True,
                         )
-                    except Exception as exc:
-                        logger.warning(
-                            f"Could not notify inactive user {user_id}: {exc}"
+                        disabled_view.add_item(btn)
+                        await message.edit(
+                            content="> Session timed out. Continue when ready.",
+                            view=disabled_view,
                         )
+                        return
+        except Exception as exc:
+            logger.warning(
+                f"Could not disable dialogue button in channel {channel.id}: {exc}"
+            )
 
-            # Remove role
-            settings = await self.db.get_guild_settings(guild_id)
-            role_id: int | None = settings.get("role_id")
-            if role_id:
-                member = guild.get_member(user_id)
-                if member:
-                    role = guild.get_role(role_id)
-                    if role:
-                        try:
-                            await member.remove_roles(role, reason="Inactivity boot")
-                        except Exception as exc:
-                            logger.warning(
-                                f"Could not remove role from {user_id}: {exc}"
-                            )
+    async def _send_alert(self, row: dict, alert_number: int) -> None:
+        """Send alert 1 or alert 2 for a user who hasn't responded to their day's content."""
+        user_id: int = row["user_id"]
+        guild_id: int = row["guild_id"]
+        day: int = row["current_day"]
+        channel_id: int | None = row.get("channel_id")
 
-            await self.db.unenroll_user(user_id, guild_id)
-            await self.bot_log.inactivity_boot(guild, user_id)
-            logger.info(f"Booted inactive user {user_id} from guild {guild_id}")
+        guild = self.bot.get_guild(guild_id)
+        if not guild or not channel_id:
+            return
+
+        channel = await _get_training_channel(self.bot, channel_id)
+        if channel is None:
+            return
+
+        if alert_number == 1:
+            await channel.send(
+                f"**Reminder, Chief.**\n\n"
+                f"Day {day} training is waiting for you. "
+                "The dialogue is above — pick up where you left off."
+            )
+            logger.info(f"Sent alert 1 for user {user_id} day {day}")
+        else:
+            # Alert 2: disable the active button first, then notify
+            await self._disable_active_dialogue_button(channel)
+            await channel.send(
+                f"**Today's session has ended, Gamblor.**\n\n"
+                f"Day {day} training will return tomorrow. Stay disciplined."
+            )
+            logger.info(f"Sent alert 2 for user {user_id} day {day}")
+
+        await self.db.update_alert_count(user_id, guild_id, alert_number)
+
+    async def _send_daily_alerts(self) -> None:
+        """
+        Fire up to two reminders per 24-hour delivery cycle.
+
+        Alert 1 fires 8 h after content delivery if the user hasn't responded.
+        Alert 2 fires 16 h after content delivery and also disables the dialogue button.
+        Both alerts are skipped once the user clicks any button (last_button_click resets).
+        No alerts are re-sent until the next day's content is delivered.
+        """
+        # Alert 1
+        for row in await self.db.get_users_needing_alert(
+            min_seconds=_ALERT1_SECONDS, alert_count=0
+        ):
+            try:
+                await self._send_alert(row, alert_number=1)
+            except Exception as exc:
+                logger.error(
+                    f"Error sending alert 1 to user {row.get('user_id')}: {exc}",
+                    exc_info=True,
+                )
+            await asyncio.sleep(0.5)
+
+        # Alert 2
+        for row in await self.db.get_users_needing_alert(
+            min_seconds=_ALERT2_SECONDS, alert_count=1
+        ):
+            try:
+                await self._send_alert(row, alert_number=2)
+            except Exception as exc:
+                logger.error(
+                    f"Error sending alert 2 to user {row.get('user_id')}: {exc}",
+                    exc_info=True,
+                )
+            await asyncio.sleep(0.5)
 
     # ──────────────────────────────────────────
     #  Daily task — runs every 30 minutes
@@ -536,17 +601,16 @@ class ProtocolCog(commands.Cog):
     async def send_daily_messages(self):
         """
         Every 30 minutes:
-        1. Deliver next-day content to users whose 24-hour window has elapsed.
-           Delivery resets last_button_click so the inactivity timer restarts.
-        2. Boot users who received content but haven't interacted for 24+ hours.
+        1. Deliver next-day (or same-day retry) content to users whose 24-hour window
+           has elapsed.  Resets the delivery timestamp and alert counter.
+        2. Send up to two inactivity reminders per delivery cycle.
+           Alert 2 also disables the dialogue button to close today's session.
         """
-        # Step 1: deliver first so users due for Day N+1 aren't wrongly booted
         await self._deliver_daily_content()
-        # Step 2: boot only truly inactive users (received content, never interacted)
-        await self._boot_inactive_users()
+        await self._send_daily_alerts()
 
     async def _deliver_daily_content(self):
-        """Send next-day training to every user whose 24-hour window has elapsed."""
+        """Send next-day (or same-day retry) training to every user whose 24-hour window has elapsed."""
         enrollments = await self.db.get_all_enrolled_users()
         if not enrollments:
             return
@@ -567,10 +631,22 @@ class ProtocolCog(commands.Cog):
 
             try:
                 user = await self.bot.fetch_user(user_id)
+
+                # Disable any leftover active button from the previous cycle before
+                # posting fresh content so only one dialogue is active at a time.
+                progress = await self.db.get_user_progress(user_id, guild_id)
+                if progress and progress.get("channel_id"):
+                    ch = await _get_training_channel(self.bot, progress["channel_id"])
+                    if ch:
+                        await self._disable_active_dialogue_button(ch)
+
                 await self.send_day_content(user, guild_id, day)
-                # Reset inactivity timer from delivery time so user gets a fresh
-                # 24-hour window to interact with today's content
-                await self.db.update_last_button_click(user_id, guild_id)
+
+                # Record delivery time and reset alert counter.
+                # Deliberately NOT updating last_button_click so alert logic can detect
+                # "no user interaction since this delivery".
+                await self.db.update_content_delivered(user_id, guild_id)
+
                 guild = self.bot.get_guild(guild_id)
                 if guild:
                     await self.bot_log.daily_delivery(guild, user, day)

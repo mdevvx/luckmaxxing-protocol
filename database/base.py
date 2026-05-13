@@ -101,3 +101,19 @@ class DatabaseBase(ABC):
     @abstractmethod
     async def get_stats(self, guild_id: Optional[int] = None) -> Dict[str, Any]:
         pass
+
+    @abstractmethod
+    async def update_content_delivered(self, user_id: int, guild_id: int) -> bool:
+        """Record that day content was just delivered; resets alert count and delivery timestamp."""
+        pass
+
+    @abstractmethod
+    async def update_alert_count(self, user_id: int, guild_id: int, count: int) -> bool:
+        pass
+
+    @abstractmethod
+    async def get_users_needing_alert(
+        self, min_seconds: int, alert_count: int
+    ) -> List[Dict[str, Any]]:
+        """Return enrolled users who have had content for min_seconds but not responded."""
+        pass
