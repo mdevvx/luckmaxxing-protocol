@@ -540,32 +540,21 @@ class ProtocolCog(commands.Cog):
         if channel is None:
             return
 
-        if alert_number == 1:
-            await channel.send(
-                f"**Reminder, Chief.**\n\n"
-                f"Day {day} training is waiting for you. "
-                "The dialogue is above — pick up where you left off."
-            )
-            logger.info(f"Sent alert 1 for user {user_id} day {day}")
-        else:
-            # Alert 2: disable the active button first, then notify
-            await self._disable_active_dialogue_button(channel)
-            await channel.send(
-                f"**Today's session has ended, Gamblor.**\n\n"
-                f"Day {day} training will return tomorrow. Stay disciplined."
-            )
-            logger.info(f"Sent alert 2 for user {user_id} day {day}")
-
+        await channel.send(
+            f"**Reminder, Chief.**\n\n"
+            f"Day {day} training is waiting for you. "
+            "The dialogue is above — pick up where you left off."
+        )
+        logger.info(f"Sent alert {alert_number} for user {user_id} day {day}")
         await self.db.update_alert_count(user_id, guild_id, alert_number)
 
     async def _send_daily_alerts(self) -> None:
         """
-        Fire up to two reminders per 24-hour delivery cycle.
+        Fire up to two identical reminders per 24-hour cycle.
 
         Alert 1 fires 8 h after content delivery if the user hasn't responded.
-        Alert 2 fires 16 h after content delivery and also disables the dialogue button.
+        Alert 2 fires 16 h after content delivery (same message, button stays active).
         Both alerts are skipped once the user clicks any button (last_button_click resets).
-        No alerts are re-sent until the next day's content is delivered.
         """
         # Alert 1
         for row in await self.db.get_users_needing_alert(
@@ -601,10 +590,9 @@ class ProtocolCog(commands.Cog):
     async def send_daily_messages(self):
         """
         Every 30 minutes:
-        1. Deliver next-day (or same-day retry) content to users whose 24-hour window
-           has elapsed.  Resets the delivery timestamp and alert counter.
-        2. Send up to two inactivity reminders per delivery cycle.
-           Alert 2 also disables the dialogue button to close today's session.
+        1. For users whose 24-hour window has elapsed: if they responded, deliver the
+           next day's content; if not, reset the alert timer without re-posting.
+        2. Send up to two identical reminder alerts per cycle until the user responds.
         """
         await self._deliver_daily_content()
         await self._send_daily_alerts()
@@ -632,9 +620,36 @@ class ProtocolCog(commands.Cog):
             try:
                 user = await self.bot.fetch_user(user_id)
 
+                progress = await self.db.get_user_progress(user_id, guild_id)
+
+                # If the user hasn't responded since the last delivery, reset the
+                # alert timer so reminders cycle again without re-posting training.
+                delivered_at = progress.get("last_content_delivered_at") if progress else None
+                if delivered_at:
+                    try:
+                        delivered_dt = datetime.fromisoformat(
+                            delivered_at.replace("Z", "+00:00")
+                        ).replace(tzinfo=None)
+                        last_click = progress.get("last_button_click")
+                        user_responded = False
+                        if last_click:
+                            click_dt = datetime.fromisoformat(
+                                last_click.replace("Z", "+00:00")
+                            ).replace(tzinfo=None)
+                            user_responded = click_dt > delivered_dt
+                        if not user_responded:
+                            await self.db.update_content_delivered(user_id, guild_id)
+                            logger.info(
+                                f"User {user_id} hasn't responded to day {day} — "
+                                "resetting alert timer, skipping re-post"
+                            )
+                            await asyncio.sleep(0.5)
+                            continue
+                    except Exception as exc:
+                        logger.warning(f"Could not check response state for {user_id}: {exc}")
+
                 # Disable any leftover active button from the previous cycle before
                 # posting fresh content so only one dialogue is active at a time.
-                progress = await self.db.get_user_progress(user_id, guild_id)
                 if progress and progress.get("channel_id"):
                     ch = await _get_training_channel(self.bot, progress["channel_id"])
                     if ch:
